@@ -411,7 +411,7 @@ class AgentHarness:
         cwd_note = f"\nWorking directory: {cwd}. All commands run from this directory."
         system_content = self.system_prompt + cwd_note
         if self.custom_context:
-            system_content = f"{self.system_prompt}\n\n[Additional Context]\n{self.custom_context}\n[/Additional Context]\n" + cwd_note
+            system_content = f"{self.system_prompt}\n\n--- Additional Context ---\n{self.custom_context}\n--- End Additional Context ---\n" + cwd_note
         return [
             {"role": "system", "content": system_content},
             {"role": "user", "content": prompt},

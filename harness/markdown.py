@@ -8,7 +8,9 @@ from io import StringIO
 from typing import Optional
 
 from rich.console import Console
+from rich.errors import MarkupError
 from rich.markdown import Markdown
+from rich.markup import escape as rich_escape
 from rich.style import Style
 from rich.theme import Theme
 
@@ -54,6 +56,9 @@ def render_markdown(text: str, console: Optional[Console] = None) -> None:
     Uses a custom theme that avoids purple/magenta — code is cyan on dark
     gray, links are blue, and headings are white.
 
+    Falls back to escaped plain text if Rich's markup parser fails
+    (e.g., due to unmatched [...] patterns in the text).
+
     Args:
         text: The markdown text to render.
         console: Optional Rich Console instance. If None, a new one is created
@@ -62,8 +67,14 @@ def render_markdown(text: str, console: Optional[Console] = None) -> None:
     if console is None:
         console = _make_console()
 
-    md = Markdown(text)
-    console.print(md)
+    try:
+        md = Markdown(text)
+        console.print(md)
+    except MarkupError:
+        # The text contains patterns that Rich's markup parser can't handle
+        # (e.g., unmatched closing tags like [/Additional Context]).
+        # Fall back to rendering as plain escaped text.
+        console.print(rich_escape(text))
 
 
 def markdown_to_plain(text: str, width: int = 100) -> str:
@@ -73,6 +84,8 @@ def markdown_to_plain(text: str, width: int = 100) -> str:
     the output as a string, preserving formatting like indentation and
     alignment but without ANSI escape codes.
 
+    Falls back to escaped text if Rich's markup parser fails.
+
     Args:
         text: The markdown text to convert.
         width: Terminal width for rendering.
@@ -81,6 +94,9 @@ def markdown_to_plain(text: str, width: int = 100) -> str:
         Rendered text representation of the markdown.
     """
     console = _make_console(width=width, no_color=True)
-    md = Markdown(text)
-    console.print(md)
+    try:
+        md = Markdown(text)
+        console.print(md)
+    except MarkupError:
+        console.print(rich_escape(text))
     return console.file.getvalue()

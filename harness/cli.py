@@ -13,6 +13,7 @@ from typing import List, Optional
 import httpx
 from rich.console import Console
 from rich.live import Live
+from rich.markup import escape as rich_escape
 from rich.text import Text
 
 from harness.markdown import render_markdown, _make_console
@@ -112,9 +113,11 @@ def _on_event(event: dict) -> None:
     elif etype == "thinking":
         content = event.get("content", "")
         # Print thinking in dim style via Rich (cross-platform safe).
+        # Escape content to prevent Rich from interpreting any [...] patterns
+        # in the model's reasoning as markup tags (e.g., [/Additional Context]).
         _thinking_streaming = False
         if _console is not None:
-            _console.print(f"\n  🧠 [dim]{content}[/dim]")
+            _console.print(f"\n  🧠 [dim]{rich_escape(content)}[/dim]")
         else:
             print(f"\n  🧠 {content}")
 
@@ -122,16 +125,18 @@ def _on_event(event: dict) -> None:
         # Stream thinking content live as it arrives.
         # Use Rich markup for cross-platform coloring — raw ANSI codes
         # show up as garbage on some terminals (ESC char gets stripped).
+        # Escape content to prevent Rich from interpreting any [...] patterns
+        # in the model's reasoning as markup tags.
         content = event.get('content', '')
         if not _thinking_streaming:
             _thinking_streaming = True
             if _console is not None:
-                _console.print(f"\n  🧠 [dim]{content}[/dim]", end="")
+                _console.print(f"\n  🧠 [dim]{rich_escape(content)}[/dim]", end="")
             else:
                 print(f"\n  🧠 {content}", end="", flush=True)
         else:
             if _console is not None:
-                _console.print(f"[dim]{content}[/dim]", end="")
+                _console.print(f"[dim]{rich_escape(content)}[/dim]", end="")
             else:
                 print(content, end="", flush=True)
 
