@@ -1,0 +1,22 @@
+[project]
+name = "harness"
+version = "0.1.0"
+description = "AI Nasa Level Genius Agent with OpenAI-compatible models, supporting read/write/edit/bash tools"
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=1.0.0",
+    "httpx>=0.24.0",
+    "rich>=13.0.0",
+]
+
+[project.scripts]
+harness = "harness.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

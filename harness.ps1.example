@@ -1,0 +1,28 @@
+# harness.ps1.example — Template for the harness launcher script
+# Copy this to harness.ps1 and fill in your API credentials.
+# harness.ps1 is gitignored — never commit your API key.
+#
+# Add this script's directory to your PATH to use 'harness' from any folder.
+#
+# Usage:
+#   harness                  # run with defaults
+#   harness --model gpt-4    # override model
+#   harness --dir C:\project # set working directory
+
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$originalDir = $PWD.Path
+
+# Run from the script's directory so python -m harness resolves correctly
+Push-Location $scriptDir
+try {
+    python -m harness `
+        --context 1000000 `
+        --reasoning-effort high `
+        --model "YOUR_MODEL" `
+        --base-url "YOUR_BASE_URL" `
+        --api-key "YOUR_API_KEY" `
+        --dir $originalDir `
+        @args
+} finally {
+    Pop-Location
+}
