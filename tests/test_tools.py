@@ -173,3 +173,43 @@ class TestToolRegistry:
         marker = tmp_path / "cwd_test_marker"
         registry.execute("bash", {"command": f'echo ok > "{marker}"'})
         assert marker.exists()
+
+
+class TestToolOutputLineLimit:
+    """Tool call responses exceeding 1,000 lines must be discarded and the agent notified."""
+
+    def test_bash_output_under_limit_is_preserved(self, tmp_path: Path):
+        registry = ToolRegistry(working_dir=str(tmp_path))
+        result = registry.execute("bash", {"command": "python -c \"for i in range(500): print(i)\""})
+        assert "499" in result
+        assert "exceeded" not in result.lower()
+
+    def test_bash_output_over_limit_is_discarded(self, tmp_path: Path):
+        registry = ToolRegistry(working_dir=str(tmp_path))
+        result = registry.execute("bash", {"command": "python -c \"for i in range(1500): print(i)\""})
+        assert "499" not in result
+        assert "exceeded" in result.lower()
+        assert "1,000" in result or "1000" in result
+        assert "try again" in result.lower()
+        assert "head" in result.lower() or "Select-Object" in result
+
+    def test_read_output_over_limit_is_discarded(self, tmp_path: Path):
+        registry = ToolRegistry(working_dir=str(tmp_path))
+        f = tmp_path / "big.txt"
+        f.write_text("\n".join(f"line {i}" for i in range(1500)))
+        result = registry.execute("read", {"path": str(f)})
+        assert "line 0" not in result
+        assert "exceeded" in result.lower()
+        assert "1,000" in result or "1000" in result
+
+    def test_exactly_1000_lines_is_allowed(self, tmp_path: Path):
+        registry = ToolRegistry(working_dir=str(tmp_path))
+        result = registry.execute("bash", {"command": "python -c \"for i in range(1000): print(i)\""})
+        assert "999" in result
+        assert "exceeded" not in result.lower()
+
+    def test_1001_lines_is_discarded(self, tmp_path: Path):
+        registry = ToolRegistry(working_dir=str(tmp_path))
+        result = registry.execute("bash", {"command": "python -c \"for i in range(1001): print(i)\""})
+        assert "exceeded" in result.lower()
+        assert "1,000" in result or "1000" in result
