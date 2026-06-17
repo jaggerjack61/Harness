@@ -66,7 +66,16 @@ class TestOnEvent:
     def setup_method(self):
         """Reset module-level state before each test."""
         import harness.cli as cli
-        cli._thinking_streaming = False
+        cli._console = None
+        cli._live = None
+        cli._no_markdown = False
+        cli._streamed_any = False
+        cli._response_text = ""
+        cli._response_renderable = None
+        cli._token_text = None
+        cli._thinking_line_buf = ""
+        cli._thinking_first_line = True
+        cli._thinking_renderable = None
 
     def test_tool_call_event_prints(self, capsys):
         _on_event({
@@ -105,22 +114,52 @@ class TestOnEvent:
         # Fallback path (no _console) uses plain text without ANSI codes
         assert "\033[90m" not in captured.out
 
-    def test_thinking_delta_event_prints_content(self, capsys):
-        """thinking_delta should output content (with Rich dim style if console available)."""
+    def test_thinking_delta_event_buffers_partial_line(self, capsys):
+        """A thinking_delta without a newline is buffered, not printed to stdout."""
+        import harness.cli as cli
         _on_event({
             "type": "thinking_delta",
             "content": "reasoning chunk",
         })
         captured = capsys.readouterr()
+        # Partial line is mirrored into the live region, not stdout (no live display here).
+        assert "reasoning chunk" not in captured.out
+        assert cli._thinking_line_buf == "reasoning chunk"
+
+    def test_thinking_delta_event_flushes_complete_line(self, capsys):
+        """A thinking_delta containing a newline flushes the complete line to stdout."""
+        _on_event({
+            "type": "thinking_delta",
+            "content": "reasoning chunk\n",
+        })
+        captured = capsys.readouterr()
         assert "reasoning chunk" in captured.out
+        assert captured.out.endswith("\n")
         assert "\033[90m" not in captured.out  # no raw ANSI codes
 
-    def test_text_delta_event_is_silent(self, capsys):
-        """text_delta should not print anything — full text rendered at text_end."""
+    def test_text_delta_event_prints_content(self, capsys):
+        """text_delta should stream content when no live display is active."""
         _on_event({
             "type": "text_delta",
             "content": "some streaming text",
         })
+        captured = capsys.readouterr()
+        assert "some streaming text" in captured.out
+
+    def test_thinking_end_finalizes_block(self, capsys):
+        """thinking_end flushes any buffered partial line to stdout."""
+        import harness.cli as cli
+        cli._thinking_line_buf = "leftover thinking"
+        _on_event({"type": "thinking_end"})
+        captured = capsys.readouterr()
+        assert "leftover thinking" in captured.out
+        assert captured.out.endswith("\n")
+        assert cli._thinking_line_buf == ""
+        assert cli._thinking_first_line is True
+
+    def test_thinking_end_with_empty_buffer_no_output(self, capsys):
+        """thinking_end with nothing buffered prints nothing extra."""
+        _on_event({"type": "thinking_end"})
         captured = capsys.readouterr()
         assert captured.out == ""
 

@@ -94,9 +94,10 @@ class TestStreamingParsing:
         
         assert text == "Final answer"
         assert reasoning == "Thinking step"
-        # Reasoning is accumulated silently during the stream — a single
-        # thinking event is emitted by run() after _process_stream returns.
-        # _process_stream itself no longer emits thinking_delta events.
+        # Reasoning is streamed live as thinking_delta events during the stream.
+        thinking_deltas = [e for e in callback_events if e["type"] == "thinking_delta"]
+        assert [e["content"] for e in thinking_deltas] == ["Thinking", " step"]
+        assert any(e["type"] == "thinking_end" for e in callback_events)
     
     def test_stream_empty_response(self):
         """Test streaming with no content."""
@@ -261,6 +262,45 @@ class TestStreamingRun:
         assert len(token_events) == 1
         assert token_events[0]["input_tokens"] == 10
         assert token_events[0]["output_tokens"] == 5
+
+    @patch("harness.agent.OpenAI")
+    def test_streaming_with_reasoning_emits_thinking_deltas(self, mock_openai):
+        """A streaming response with reasoning emits thinking_delta events."""
+        mock_client = MagicMock()
+        mock_openai.return_value = mock_client
+
+        def make_stream():
+            for chunk_data in [
+                {"reasoning": "Let me think", "content": None},
+                {"reasoning": " step by step", "content": None},
+                {"reasoning": None, "content": "Answer"},
+            ]:
+                chunk = MagicMock()
+                choice = MagicMock()
+                delta = MagicMock()
+                delta.content = chunk_data["content"]
+                delta.tool_calls = None
+                delta.reasoning_content = chunk_data["reasoning"]
+                delta.thinking = None
+                delta.thought = None
+                choice.delta = delta
+                choice.finish_reason = "stop"
+                chunk.choices = [choice]
+                chunk.usage = None
+                yield chunk
+
+        mock_client.chat.completions.create.return_value = make_stream()
+
+        agent = AgentHarness(model="test-model", api_key="sk-test")
+        events = []
+        result = agent.run("Hi", callback=events.append, stream=True)
+
+        assert result == "Answer"
+        thinking_deltas = [e for e in events if e["type"] == "thinking_delta"]
+        assert [e["content"] for e in thinking_deltas] == ["Let me think", " step by step"]
+        assert any(e["type"] == "thinking_end" for e in events)
+        # No full thinking block event should be emitted in streaming mode.
+        assert not any(e["type"] == "thinking" for e in events)
 
     @patch("harness.agent.OpenAI")
     def test_streaming_tool_call_loop(self, mock_openai):

@@ -42,7 +42,7 @@ class AgentHarness:
         base_url: Optional[str] = None,
         system_prompt: Optional[str] = None,
         working_dir: Optional[str] = None,
-        max_turns: int = 1000,
+        max_turns: int = 10000,
         reasoning_effort: Optional[str] = None,
         context_window: int = 1000000,
     ):
@@ -85,7 +85,9 @@ class AgentHarness:
             callback: Optional callable receiving progress events as dicts.
                 Event types:
                 - {"type": "tokens", "input_tokens": N, "output_tokens": N, ...}  (live token usage after each API call)
-                - {"type": "thinking", "content": "..."}  (reasoning/chain-of-thought)
+                - {"type": "thinking", "content": "..."}  (reasoning/chain-of-thought, non-streaming)
+                - {"type": "thinking_delta", "content": "..."}  (incremental reasoning, streaming only)
+                - {"type": "thinking_end"}  (end of a streaming reasoning block)
                 - {"type": "text", "content": "..."}  (model text response, non-streaming)
                 - {"type": "text_delta", "content": "..."}  (incremental text, streaming only)
                 - {"type": "text_end", "content": "..."}  (final complete text, streaming only)
@@ -183,9 +185,10 @@ class AgentHarness:
                 text, reasoning, tool_calls = self._parse_response(response)
 
             # Emit thinking/reasoning if present (before tool calls or text).
-            # We accumulate reasoning silently during the stream and emit it
-            # as one complete block to avoid Rich Live display interference.
-            if reasoning and callback:
+            # In streaming mode, _process_stream already emitted thinking_delta
+            # events, so we only emit the full thinking block here for the
+            # non-streaming path.
+            if reasoning and callback and not stream:
                 callback({
                     "type": "thinking",
                     "content": reasoning,
@@ -281,8 +284,15 @@ class AgentHarness:
         """
         full_text = ""
         full_reasoning = ""
+        thinking_open = False  # whether a thinking_delta block is currently open
         tool_calls_map: Dict[int, Dict[str, Any]] = {}  # index -> {id, name, arguments_str}
         usage = None
+
+        def _close_thinking() -> None:
+            nonlocal thinking_open
+            if thinking_open and callback:
+                callback({"type": "thinking_end"})
+            thinking_open = False
 
         for chunk in stream:
             # Extract usage from the final chunk if available
@@ -313,14 +323,26 @@ class AgentHarness:
                     })
 
             # Handle reasoning content (different providers use different fields).
-            # Accumulate silently — we emit a single thinking block after the
-            # stream completes to avoid Rich Live display overwriting partial output.
+            # Accumulate for history, but also emit live thinking_delta events so
+            # the CLI can show reasoning progress as it arrives.
             reasoning_delta = self._extract_reasoning_delta(delta)
             if reasoning_delta:
                 full_reasoning += reasoning_delta
+                thinking_open = True
+                if callback:
+                    callback({
+                        "type": "thinking_delta",
+                        "content": reasoning_delta,
+                    })
+
+            # Handle text content. Once non-reasoning output starts, close the
+            # current thinking block so the CLI can finalize its line.
+            if delta.content:
+                _close_thinking()
 
             # Handle tool calls
             if delta.tool_calls:
+                _close_thinking()
                 for tc_delta in delta.tool_calls:
                     idx = tc_delta.index
                     if idx not in tool_calls_map:
@@ -352,6 +374,8 @@ class AgentHarness:
                 "name": tc["name"],
                 "arguments": args,
             })
+
+        _close_thinking()
 
         text = full_text if full_text else None
         reasoning = full_reasoning if full_reasoning else None
