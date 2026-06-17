@@ -6,7 +6,16 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
-from harness.cli import _build_parser, _on_event, _prompt_reasoning_selection, REASONING_OPTIONS
+from prompt_toolkit.keys import Keys
+
+from harness.cli import (
+    _build_parser,
+    _interactive_select,
+    _on_event,
+    _prompt_model_selection,
+    _prompt_reasoning_selection,
+    REASONING_OPTIONS,
+)
 
 
 class TestArgumentParser:
@@ -525,6 +534,76 @@ class TestBuildTokenText:
         # Should still show the usual stats without errors
         assert "100" in rendered
         assert "50" in rendered
+
+
+def _make_fake_application(key_sequence):
+    """Build a fake prompt_toolkit Application that replays a key sequence."""
+    class FakeApp:
+        def __init__(self, **kwargs):
+            self.kb = kwargs.get("key_bindings")
+            self.invalidate = MagicMock()
+            self.exit = MagicMock()
+
+        def run(self):
+            event = MagicMock()
+            event.app = self
+            for key in key_sequence:
+                bindings = self.kb.get_bindings_for_keys((key,))
+                assert bindings, f"No binding registered for {key}"
+                bindings[0].handler(event)
+
+    return FakeApp
+
+
+class TestInteractiveSelect:
+    def test_select_second_option(self):
+        fake_app = _make_fake_application([Keys.Down, Keys.Enter])
+        with patch("harness.cli.Application", fake_app):
+            selected = _interactive_select(["gpt-4", "gpt-3.5-turbo", "claude-3"], "gpt-4", "Models")
+        assert selected == "gpt-3.5-turbo"
+
+    def test_cancel_with_escape_returns_none(self):
+        fake_app = _make_fake_application([Keys.Escape])
+        with patch("harness.cli.Application", fake_app):
+            selected = _interactive_select(["gpt-4", "gpt-3.5-turbo"], "gpt-4", "Models")
+        assert selected is None
+
+    def test_up_wraps_to_last_option(self):
+        fake_app = _make_fake_application([Keys.Up, Keys.Enter])
+        with patch("harness.cli.Application", fake_app):
+            selected = _interactive_select(["gpt-4", "gpt-3.5-turbo", "claude-3"], "gpt-4", "Models")
+        assert selected == "claude-3"
+
+
+class TestModelPrompt:
+    @patch("builtins.input", return_value="1")
+    def test_numeric_fallback_valid_selection(self, mock_input):
+        models = ["gpt-4", "gpt-3.5-turbo", "claude-3"]
+        selected = _prompt_model_selection(models, "claude-3")
+        assert selected == "gpt-4"
+
+    @patch("builtins.input", return_value="")
+    def test_numeric_fallback_cancel_returns_none(self, mock_input):
+        models = ["gpt-4", "gpt-3.5-turbo"]
+        selected = _prompt_model_selection(models, "gpt-4")
+        assert selected is None
+
+    @patch("builtins.input", return_value="invalid")
+    def test_numeric_fallback_invalid_input_returns_none(self, mock_input):
+        models = ["gpt-4", "gpt-3.5-turbo"]
+        selected = _prompt_model_selection(models, "gpt-4")
+        assert selected is None
+
+    @patch("harness.cli._interactive_select")
+    def test_interactive_path_uses_inline_selector(self, mock_select):
+        models = ["gpt-4", "gpt-3.5-turbo", "claude-3"]
+        mock_select.return_value = "claude-3"
+
+        with patch.object(sys.stdin, "isatty", return_value=True):
+            selected = _prompt_model_selection(models, "gpt-4")
+
+        assert selected == "claude-3"
+        mock_select.assert_called_once_with(models, "gpt-4", title="📋 Available models")
 
 
 class TestReasoningPrompt:

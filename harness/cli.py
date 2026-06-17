@@ -11,6 +11,10 @@ import sys
 from typing import List, Optional
 
 import httpx
+from prompt_toolkit.application import Application
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.layout import Layout, Window
+from prompt_toolkit.layout.controls import FormattedTextControl
 from rich.console import Console
 from rich.live import Live
 from rich.markup import escape as rich_escape
@@ -329,12 +333,8 @@ def _read_multiline_context() -> Optional[str]:
     return "\n".join(lines)
 
 
-def _prompt_model_selection(models: List[str], current_model: str) -> Optional[str]:
-    """Display models and prompt user to select one. Returns selected model or None."""
-    if not models:
-        print("No models available.")
-        return None
-
+def _prompt_model_selection_numeric(models: List[str], current_model: str) -> Optional[str]:
+    """Numeric fallback for selecting a model when interactive input isn't available."""
     print("\n📋 Available models:")
     print("─" * 50)
     for i, model in enumerate(models, 1):
@@ -357,6 +357,89 @@ def _prompt_model_selection(models: List[str], current_model: str) -> Optional[s
     except ValueError:
         print("❌ Invalid input. Please enter a number.")
         return None
+
+
+def _interactive_select(options: List[str], current: str, title: str) -> Optional[str]:
+    """Show a lightweight inline list selector using the arrow keys.
+
+    Renders at the current cursor position without clearing the screen, so the
+    existing terminal contents stay visible. Returns the selected option or None.
+    """
+    if not options:
+        return None
+
+    print(f"\n{title}:")
+    print("─" * 50)
+    print(f"Current model: {current}")
+    print("Use ↑/↓ to navigate, Enter to select, Esc to cancel.\n")
+
+    index = options.index(current) if current in options else 0
+    result: List[Optional[str]] = [None]
+
+    kb = KeyBindings()
+
+    @kb.add("up")
+    def _up(event) -> None:
+        nonlocal index
+        index = (index - 1) % len(options)
+        event.app.invalidate()
+
+    @kb.add("down")
+    def _down(event) -> None:
+        nonlocal index
+        index = (index + 1) % len(options)
+        event.app.invalidate()
+
+    @kb.add("enter")
+    def _enter(event) -> None:
+        result[0] = options[index]
+        event.app.exit()
+
+    @kb.add("escape")
+    @kb.add("c-c")
+    def _cancel(event) -> None:
+        event.app.exit()
+
+    def _get_text():
+        fragments = []
+        for i, opt in enumerate(options):
+            pointer = "> " if i == index else "  "
+            style = "reverse bold" if i == index else ""
+            fragments.append((style, f"{pointer}{opt}\n"))
+        return fragments
+
+    control = FormattedTextControl(_get_text)
+    layout = Layout(
+        Window(control, height=len(options), wrap_lines=False)
+    )
+    app = Application(
+        layout=layout,
+        key_bindings=kb,
+        full_screen=False,
+        erase_when_done=False,
+        mouse_support=True,
+    )
+    app.run()
+    return result[0]
+
+
+def _prompt_model_selection(models: List[str], current_model: str) -> Optional[str]:
+    """Display models and let the user pick one using arrow keys + Enter.
+
+    Falls back to numeric input when stdin is not an interactive terminal.
+    """
+    if not models:
+        print("No models available.")
+        return None
+
+    if not sys.stdin.isatty():
+        return _prompt_model_selection_numeric(models, current_model)
+
+    try:
+        return _interactive_select(models, current_model, title="📋 Available models")
+    except Exception as e:
+        print(f"❌ Interactive selection failed ({e}); falling back to numeric input.")
+        return _prompt_model_selection_numeric(models, current_model)
 
 
 REASONING_OPTIONS = ["low", "medium", "high", "xhigh", "max"]
