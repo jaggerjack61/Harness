@@ -32,6 +32,8 @@ _live: Optional[Live] = None
 _no_markdown: bool = False  # set by main() from --no-markdown flag
 _streamed_any: bool = False  # whether we have printed any text_delta this response
 _response_text: str = ""  # accumulated response text for the live display
+_response_complete: str = ""  # newline-terminated prefix of _response_text (Markdown-parsed)
+_response_md: Optional[Any] = None  # cached Markdown renderable for the complete portion
 _response_renderable: Optional[Any] = None  # current response renderable in Live
 _token_text: Optional[Text] = None  # current token status bar renderable
 # Thinking-streaming state. Reasoning is emitted as many small deltas that are
@@ -45,15 +47,54 @@ _thinking_renderable: Optional[Text] = None  # partial-line mirror shown in the 
 
 def _reset_stream_state() -> None:
     """Reset per-response streaming state before a new agent turn."""
-    global _streamed_any, _response_text, _response_renderable, _token_text
+    global _streamed_any, _response_text, _response_complete, _response_md
+    global _response_renderable, _token_text
     global _thinking_line_buf, _thinking_first_line, _thinking_renderable
     _streamed_any = False
     _response_text = ""
+    _response_complete = ""
+    _response_md = None
     _response_renderable = None
     _token_text = None
     _thinking_line_buf = ""
     _thinking_first_line = True
     _thinking_renderable = None
+
+
+def _rebuild_response_md() -> None:
+    """Rebuild the cached Markdown renderable for the complete (newline-terminated) portion.
+
+    Only called when a line boundary is crossed, so the O(n) Markdown parse
+    happens per-line rather than per-character.
+    """
+    global _response_md
+    if _no_markdown or not _response_complete:
+        _response_md = None
+        return
+    try:
+        _response_md = Markdown(f"🤖 {_response_complete}")
+    except MarkupError:
+        _response_md = Text(rich_escape(_response_complete))
+
+
+def _build_response_renderable() -> Optional[Any]:
+    """Build the live response renderable.
+
+    Hybrid strategy: the newline-terminated prefix is rendered as Markdown
+    (rebuilt only when a line completes), and the trailing partial line is
+    appended as plain ``Text``. This gives styled structure (headings, bold,
+    code blocks) as soon as each line lands, without within-line reflow or
+    per-character re-parsing.
+    """
+    if _no_markdown:
+        return Text(f"🤖 {_response_text}") if _response_text else None
+    partial = _response_text[len(_response_complete):]
+    if not _response_complete:
+        # No complete lines yet — show the partial as plain text with the prefix.
+        return Text(f"🤖 {partial}") if partial else None
+    if not partial:
+        return _response_md
+    return Group(_response_md, Text(partial))
 
 
 def _update_live() -> None:
@@ -185,8 +226,8 @@ def _flush_thinking_end() -> None:
 
 def _on_event(event: dict) -> None:
     """Handle a progress event from the agent — print live status."""
-    global _streamed_any, _response_text, _response_renderable
-    global _thinking_line_buf, _thinking_first_line, _thinking_renderable
+    global _streamed_any, _response_text, _response_complete, _response_md
+    global _response_renderable, _thinking_line_buf, _thinking_first_line, _thinking_renderable
     etype = event["type"]
 
     BLUE = "\033[34m"
@@ -291,9 +332,11 @@ def _on_event(event: dict) -> None:
         pass
 
     elif etype == "text_delta":
-        # Stream the response text live. When a Live display is active the
-        # text is accumulated into an in-place renderable; otherwise we fall
-        # back to plain stdout writes.
+        # Stream the response text live using the hybrid strategy: complete
+        # (newline-terminated) lines are folded into a cached Markdown
+        # renderable, while the trailing partial line is shown as plain Text.
+        # The Markdown is only re-parsed when a line boundary is crossed, so
+        # within-line deltas are cheap and don't cause reflow.
         content = event.get("content", "")
         if not content:
             pass
@@ -301,30 +344,29 @@ def _on_event(event: dict) -> None:
             _streamed_any = True
             if _live is not None:
                 _response_text += content
-                if _response_renderable is None:
-                    _response_renderable = Text("🤖 ")
-                if isinstance(_response_renderable, Text):
-                    _response_renderable.append(content)
-                else:
-                    _response_renderable = Text(f"🤖 {_response_text}")
+                # Fold any newly-completed lines into the Markdown cache.
+                idx = _response_text.rfind("\n")
+                new_complete = _response_text[:idx + 1] if idx >= 0 else ""
+                if new_complete != _response_complete:
+                    _response_complete = new_complete
+                    _rebuild_response_md()
+                _response_renderable = _build_response_renderable()
                 _update_live()
             else:
                 print(content, end="", flush=True)
 
     elif etype == "text_end":
-        # Streaming complete — replace the live plain text with the final
-        # formatted Markdown (or plain text) in-place.
+        # Streaming complete — fold the trailing partial line into the
+        # Markdown cache too, so the final render is fully styled.
         content = event.get("content", "")
         if _live is not None:
             _response_text = content
+            _response_complete = content  # entire response is now "complete"
             if _no_markdown:
                 _response_renderable = Text(f"🤖 {content}\n")
             else:
-                try:
-                    md = Markdown(f"🤖 {content}")
-                except MarkupError:
-                    md = Text(rich_escape(content))
-                _response_renderable = md
+                _rebuild_response_md()
+                _response_renderable = _response_md
             _update_live()
         else:
             # Fallback for tests or when live display isn't active.

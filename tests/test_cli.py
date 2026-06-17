@@ -71,6 +71,8 @@ class TestOnEvent:
         cli._no_markdown = False
         cli._streamed_any = False
         cli._response_text = ""
+        cli._response_complete = ""
+        cli._response_md = None
         cli._response_renderable = None
         cli._token_text = None
         cli._thinking_line_buf = ""
@@ -145,6 +147,57 @@ class TestOnEvent:
         })
         captured = capsys.readouterr()
         assert "some streaming text" in captured.out
+
+    def test_text_delta_partial_line_not_folded_into_markdown(self, capsys):
+        """A partial-line text_delta (no newline) stays as plain Text, not Markdown."""
+        import harness.cli as cli
+        from rich.text import Text
+        from unittest.mock import MagicMock
+        cli._live = MagicMock()  # truthy so the live path runs
+        cli._no_markdown = False
+        _on_event({
+            "type": "text_delta",
+            "content": "**not yet bold**",
+        })
+        # No newline -> nothing folded into the Markdown cache.
+        assert cli._response_complete == ""
+        assert cli._response_md is None
+        # The renderable is a plain Text carrying the raw markdown syntax.
+        assert isinstance(cli._response_renderable, Text)
+        assert "**not yet bold**" in str(cli._response_renderable)
+
+    def test_text_delta_complete_line_folded_into_markdown(self, capsys):
+        """A newline-terminated text_delta folds the line into the Markdown cache."""
+        import harness.cli as cli
+        from rich.markdown import Markdown
+        from unittest.mock import MagicMock
+        cli._live = MagicMock()  # truthy so the live path runs
+        cli._no_markdown = False
+        _on_event({
+            "type": "text_delta",
+            "content": "## Heading\n",
+        })
+        assert cli._response_complete == "## Heading\n"
+        assert isinstance(cli._response_md, Markdown)
+        # Trailing partial is empty, so the renderable is the Markdown itself.
+        assert cli._response_renderable is cli._response_md
+
+    def test_text_delta_hybrid_markdown_plus_partial(self, capsys):
+        """Complete lines render as Markdown with the trailing partial as plain Text."""
+        import harness.cli as cli
+        from rich.console import Group
+        from rich.markdown import Markdown
+        from rich.text import Text
+        from unittest.mock import MagicMock
+        cli._live = MagicMock()
+        cli._no_markdown = False
+        _on_event({"type": "text_delta", "content": "## Heading\npartial "})
+        assert cli._response_complete == "## Heading\n"
+        assert isinstance(cli._response_md, Markdown)
+        assert isinstance(cli._response_renderable, Group)
+        # First part is the cached Markdown, second is the partial Text.
+        assert cli._response_renderable.renderables[0] is cli._response_md
+        assert isinstance(cli._response_renderable.renderables[1], Text)
 
     def test_thinking_end_finalizes_block(self, capsys):
         """thinking_end flushes any buffered partial line to stdout."""
