@@ -36,8 +36,13 @@ _MARKDOWN_THEME = Theme({
 })
 
 
-def _make_console(width: int = 100, no_color: bool = False) -> Console:
-    """Create a Rich Console with the custom markdown theme."""
+def _make_console(width: Optional[int] = None, no_color: bool = False) -> Console:
+    """Create a Rich Console with the custom markdown theme.
+
+    When ``width`` is ``None`` (the default), Rich auto-detects the terminal
+    width. A fixed width can still be passed for testing or plain-text
+    conversion.
+    """
     return Console(
         file=StringIO() if no_color else None,
         width=width,

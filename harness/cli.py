@@ -224,8 +224,13 @@ def _on_event(event: dict) -> None:
             print()
 
 
-def _build_token_text(event: dict) -> Text:
-    """Build a Rich Text renderable for the live token status bar."""
+def _build_token_text(event: dict, max_width: Optional[int] = None) -> Text:
+    """Build a Rich Text renderable for the live token status bar.
+
+    If ``max_width`` is provided, the status line is progressively compacted
+    (fewer spaces, optional fields dropped) so that it fits within the
+    terminal without being truncated.
+    """
     input_tk = event.get("input_tokens", 0)
     output_tk = event.get("output_tokens", 0)
     total_tk = event.get("total_tokens", 0)
@@ -236,53 +241,88 @@ def _build_token_text(event: dict) -> Text:
     model = event.get("model")
     reasoning_effort = event.get("reasoning_effort")
 
-    parts: List[str] = []
-    styles: List[str] = []
-
-    parts.append("📊 ")
-    styles.append("bold")
-
+    # Required fields: icon, model (if known), core counters, and turn delta.
+    required: List[tuple] = [("📊", "bold")]
     if model:
-        parts.append(f"{model}  ")
-        styles.append("bold magenta")
+        required.append((model, "bold magenta"))
+    required.extend([
+        (f"In:{input_tk:,}", "cyan"),
+        (f"Out:{output_tk:,}", "green"),
+        (f"Tot:{total_tk:,}", "bold"),
+    ])
 
-    parts.append(f"In:{input_tk:,}  ")
-    styles.append("cyan")
-
-    parts.append(f"Out:{output_tk:,}  ")
-    styles.append("green")
-
-    parts.append(f"Tot:{total_tk:,}  ")
-    styles.append("bold")
-
+    # Optional fields, in the order they are displayed.
+    optional: List[tuple] = []
+    ctx_text = None
     if context_window:
         ctx_used_pct = (turn_input / context_window) * 100 if context_window > 0 else 0
         ctx_style = "green" if ctx_used_pct < 50 else "yellow" if ctx_used_pct < 80 else "red"
-        parts.append(f"Ctx:{ctx_used_pct:.1f}%  ")
-        styles.append(ctx_style)
-
+        ctx_text = f"Ctx:{ctx_used_pct:.1f}%"
+        optional.append((ctx_text, ctx_style))
+    cache_full_text = None
+    cache_raw_text = None
     if cached_tk > 0:
         cache_rate = (cached_tk / total_tk * 100) if total_tk > 0 else 0
-        parts.append(f"Cache:{cached_tk:,} ({cache_rate:.1f}%)  ")
-        styles.append("yellow")
-
+        cache_raw_text = f"Cache:{cached_tk:,}"
+        cache_full_text = f"Cache:{cached_tk:,} ({cache_rate:.1f}%)"
+        optional.append((cache_full_text, "yellow"))
+    reasoning_text = None
     if reasoning_effort:
-        parts.append(f"🧠 {reasoning_effort}  ")
-        styles.append("dim")
+        reasoning_text = f"🧠 {reasoning_effort}"
+        optional.append((reasoning_text, "dim"))
 
-    parts.append(f"[+{turn_input:,}/{turn_output:,}]")
-    styles.append("dim")
+    delta = (f"[+{turn_input:,}/{turn_output:,}]", "dim")
 
-    text = Text(no_wrap=True)
-    for part, style in zip(parts, styles):
-        text.append(part, style=style)
-    return text
+    def _assemble(parts: List[tuple], spacing: str) -> Text:
+        text = Text(no_wrap=True)
+        for i, (part, style) in enumerate(parts):
+            if i:
+                text.append(spacing, style="")
+            text.append(part, style=style)
+        return text
+
+    def _with_raw_cache(parts: List[tuple]) -> List[tuple]:
+        """Replace the combined Cache field with just the raw cache count."""
+        if cache_full_text is None:
+            return parts
+        return [
+            (cache_raw_text, "yellow") if text == cache_full_text else (text, style)
+            for text, style in parts
+        ]
+
+    def _without(parts: List[tuple], exclude: set) -> List[tuple]:
+        """Return the given parts excluding any whose text is in ``exclude``."""
+        return [part for part in parts if part[0] not in exclude]
+
+    # Build candidates from most detailed to most compact.
+    candidates: List[tuple] = [
+        (required + optional + [delta], "  "),                       # full detail, double spacing
+        (required + optional + [delta], " "),                        # full detail, single spacing
+        (required + _with_raw_cache(optional) + [delta], " "),       # drop cache rate percentage
+        (required + _without(_with_raw_cache(optional), {reasoning_text}) + [delta], " "),
+        (required + _without(_with_raw_cache(optional), {reasoning_text, ctx_text}) + [delta], " "),
+        (required + [delta], " "),                                    # no optional fields
+    ]
+    # Ultra-narrow fallback: drop the model name too.
+    if model:
+        minimal_required = required[:1] + required[2:]
+        candidates.append((minimal_required + [delta], " "))
+
+    for parts, spacing in candidates:
+        text = _assemble(parts, spacing)
+        cell_len = getattr(text, "cell_length", text.cell_len)
+        if max_width is None or cell_len <= max_width:
+            return text
+
+    # Fallback to the smallest candidate (should never reach here).
+    return _assemble(candidates[-1][0], candidates[-1][1])
 
 
 def _print_tokens(event: dict) -> None:
     """Update the live token status bar via Rich, or print directly if no live display."""
     global _live, _console
-    text = _build_token_text(event)
+    max_width = _console.width if _console is not None else None
+    text = _build_token_text(event, max_width=max_width)
     if _live is not None:
         _live.update(text)
     else:
