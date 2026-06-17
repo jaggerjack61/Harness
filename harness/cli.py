@@ -558,7 +558,7 @@ def _prompt_model_selection_numeric(models: List[str], current_model: str) -> Op
         return None
 
 
-def _interactive_select(options: List[str], current: str, title: str) -> Optional[str]:
+def _interactive_select(options: List[str], current: str, title: str, current_label: str = "Current model") -> Optional[str]:
     """Show a lightweight inline list selector using the arrow keys.
 
     Renders at the current cursor position without clearing the screen, so the
@@ -569,7 +569,7 @@ def _interactive_select(options: List[str], current: str, title: str) -> Optiona
 
     print(f"\n{title}:")
     print("─" * 50)
-    print(f"Current model: {current}")
+    print(f"{current_label}: {current}")
     print("Use ↑/↓ to navigate, Enter to select, Esc to cancel.\n")
 
     index = options.index(current) if current in options else 0
@@ -644,8 +644,8 @@ def _prompt_model_selection(models: List[str], current_model: str) -> Optional[s
 REASONING_OPTIONS = ["low", "medium", "high", "xhigh", "max"]
 
 
-def _prompt_reasoning_selection(current_effort: Optional[str]) -> Optional[str]:
-    """Display reasoning options and prompt user to select one. Returns selected or None."""
+def _prompt_reasoning_selection_numeric(current_effort: Optional[str]) -> Optional[str]:
+    """Numeric fallback for reasoning effort selection when not a TTY."""
     print("\n🧠 Reasoning effort:")
     print("─" * 30)
     for i, level in enumerate(REASONING_OPTIONS, 1):
@@ -668,6 +668,26 @@ def _prompt_reasoning_selection(current_effort: Optional[str]) -> Optional[str]:
     except ValueError:
         print("❌ Invalid input. Please enter a number.")
         return None
+
+
+def _prompt_reasoning_selection(current_effort: Optional[str]) -> Optional[str]:
+    """Display reasoning options and let the user pick one using arrow keys + Enter.
+
+    Falls back to numeric input when stdin is not an interactive terminal.
+    """
+    current = current_effort or "high"
+
+    if not sys.stdin.isatty():
+        return _prompt_reasoning_selection_numeric(current_effort)
+
+    try:
+        return _interactive_select(
+            REASONING_OPTIONS, current, title="🧠 Reasoning effort",
+            current_label="Current effort",
+        )
+    except Exception as e:
+        print(f"❌ Interactive selection failed ({e}); falling back to numeric input.")
+        return _prompt_reasoning_selection_numeric(current_effort)
 
 
 def _build_welcome_box(model: str, reasoning_effort: str, context_window: int, working_dir: str, streaming: bool = True) -> str:

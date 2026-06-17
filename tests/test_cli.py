@@ -771,3 +771,16 @@ class TestReasoningPrompt:
     def test_invalid_input_returns_none(self, mock_input):
         selected = _prompt_reasoning_selection("high")
         assert selected is None
+
+    @patch("harness.cli._interactive_select")
+    def test_interactive_path_uses_inline_selector(self, mock_select):
+        mock_select.return_value = "xhigh"
+
+        with patch.object(sys.stdin, "isatty", return_value=True):
+            selected = _prompt_reasoning_selection("high")
+
+        assert selected == "xhigh"
+        mock_select.assert_called_once_with(
+            REASONING_OPTIONS, "high", title="🧠 Reasoning effort",
+            current_label="Current effort",
+        )
