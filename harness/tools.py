@@ -1,5 +1,6 @@
 """Tool definitions and executors for the Nasa Level Genius Agent."""
 
+import itertools
 import platform
 import subprocess
 from pathlib import Path
@@ -167,11 +168,16 @@ def read_file(path: str, offset: Optional[int] = None, limit: Optional[int] = No
     except Exception as e:
         return f"Error reading file: {e}"
 
+    if offset is not None and offset < 1:
+        return f"Error: offset must be >= 1 (got {offset})"
+
     if offset is not None or limit is not None:
-        lines = text.splitlines()
         start = (offset - 1) if offset else 0
         end = (start + limit) if limit else None
-        text = "\n".join(lines[start:end])
+        # Avoid loading very large files into memory when only a slice is needed.
+        with p.open("r", encoding="utf-8", errors="replace") as f:
+            lines = list(itertools.islice(f, start, end))
+        text = "".join(lines)
 
     return text
 
@@ -218,7 +224,7 @@ def edit_file(path: str, edits: List[Dict[str, str]], cwd: Optional[str] = None)
         return f"Error: File not found: {path}"
 
     try:
-        text = p.read_text(encoding="utf-8")
+        text = p.read_text(encoding="utf-8", errors="replace")
     except Exception as e:
         return f"Error reading file: {e}"
 
@@ -317,18 +323,34 @@ class ToolRegistry:
         return _enforce_line_limit(result, name)
 
     def _handle_read(self, args: Dict[str, Any]) -> str:
+        path = args.get("path")
+        if path is None:
+            return "Error: 'path' is required for read tool."
         return read_file(
-            path=args["path"],
+            path=path,
             offset=args.get("offset"),
             limit=args.get("limit"),
             cwd=self.working_dir,
         )
 
     def _handle_write(self, args: Dict[str, Any]) -> str:
-        return write_file(path=args["path"], content=args["content"], cwd=self.working_dir)
+        path = args.get("path")
+        if path is None:
+            return "Error: 'path' is required for write tool."
+        if "content" not in args:
+            return "Error: 'content' is required for write tool."
+        return write_file(path=path, content=args["content"], cwd=self.working_dir)
 
     def _handle_edit(self, args: Dict[str, Any]) -> str:
-        return edit_file(path=args["path"], edits=args["edits"], cwd=self.working_dir)
+        path = args.get("path")
+        if path is None:
+            return "Error: 'path' is required for edit tool."
+        if "edits" not in args:
+            return "Error: 'edits' is required for edit tool."
+        return edit_file(path=path, edits=args["edits"], cwd=self.working_dir)
 
     def _handle_bash(self, args: Dict[str, Any]) -> str:
-        return run_bash(command=args["command"], cwd=self.working_dir)
+        command = args.get("command")
+        if command is None:
+            return "Error: 'command' is required for bash tool."
+        return run_bash(command=command, cwd=self.working_dir)

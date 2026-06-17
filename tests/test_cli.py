@@ -405,6 +405,45 @@ class TestCliMain:
         main(["--api-key", "sk-test"])
         assert mock_agent.reasoning_effort == "high"
 
+    @patch("harness.cli.AgentHarness")
+    @patch("harness.cli.input")
+    def test_context_command_sets_context(self, mock_input, mock_harness):
+        """Typing /context should set the agent's custom context."""
+        mock_agent = MagicMock()
+        mock_agent.get_custom_context.return_value = "Some context"
+        mock_harness.return_value = mock_agent
+        mock_input.side_effect = ["/context", "Some context", ".", "/exit"]
+
+        from harness.cli import main
+        main(["--api-key", "sk-test"])
+        mock_agent.set_custom_context.assert_called_once_with("Some context")
+
+    @patch("harness.cli.AgentHarness")
+    @patch("harness.cli.input")
+    def test_context_clear_command_clears_context(self, mock_input, mock_harness):
+        """Typing /context clear should clear the custom context."""
+        mock_agent = MagicMock()
+        mock_harness.return_value = mock_agent
+        mock_input.side_effect = ["/context clear", "/exit"]
+
+        from harness.cli import main
+        main(["--api-key", "sk-test"])
+        mock_agent.set_custom_context.assert_called_once_with(None)
+
+    @patch("harness.cli.AgentHarness")
+    @patch("harness.cli.input")
+    def test_context_show_command_prints_context(self, mock_input, mock_harness, capsys):
+        """Typing /context show should display the current custom context."""
+        mock_agent = MagicMock()
+        mock_agent.get_custom_context.return_value = "Current context"
+        mock_harness.return_value = mock_agent
+        mock_input.side_effect = ["/context show", "/exit"]
+
+        from harness.cli import main
+        main(["--api-key", "sk-test"])
+        captured = capsys.readouterr()
+        assert "Current context" in captured.out
+
 
 class TestTokensEventDisplay:
     """Live token events should print stats in a compact format."""
@@ -534,6 +573,25 @@ class TestBuildTokenText:
         # Should still show the usual stats without errors
         assert "100" in rendered
         assert "50" in rendered
+
+    def test_token_text_does_not_wrap(self):
+        """Status bar text should stay on a single line even when long."""
+        from harness.cli import _build_token_text
+        event = {
+            "type": "tokens",
+            "input_tokens": 36103,
+            "output_tokens": 674,
+            "total_tokens": 36777,
+            "cached_tokens": 20096,
+            "turn_input": 15901,
+            "turn_output": 393,
+            "turn_cached": 0,
+            "context_window": 1000000,
+            "model": "mimo-v2.5-pro",
+            "reasoning_effort": "high",
+        }
+        text = _build_token_text(event)
+        assert text.no_wrap is True
 
 
 def _make_fake_application(key_sequence):

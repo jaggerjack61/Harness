@@ -273,7 +273,7 @@ def _build_token_text(event: dict) -> Text:
     parts.append(f"[+{turn_input:,}/{turn_output:,}]")
     styles.append("dim")
 
-    text = Text()
+    text = Text(no_wrap=True)
     for part, style in zip(parts, styles):
         text.append(part, style=style)
     return text

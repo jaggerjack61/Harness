@@ -2,7 +2,7 @@
 
 import json
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from openai import OpenAI
 
@@ -75,7 +75,7 @@ class AgentHarness:
     def run(
         self,
         prompt: str,
-        callback: Optional[callable] = None,
+        callback: Optional[Callable[..., Any]] = None,
         stream: bool = False,
     ) -> str:
         """Run the agent with a user prompt and return the final response.
@@ -268,7 +268,7 @@ class AgentHarness:
     def _process_stream(
         self,
         stream: Any,
-        callback: Optional[callable] = None,
+        callback: Optional[Callable[..., Any]] = None,
     ) -> Tuple[Optional[str], Optional[str], List[Dict[str, Any]], Optional[Dict[str, Any]]]:
         """Process a streaming response from the API.
 
@@ -391,13 +391,14 @@ class AgentHarness:
 
     def set_custom_context(self, text: Optional[str]) -> None:
         """Set custom context text that will be prepended to the system prompt.
-        
-        Set to None or empty string to clear.
+
+        Set to None or empty string to clear. If a conversation is already in
+        progress, the existing system message is updated so the new context is
+        visible immediately.
         """
-        if text:
-            self.custom_context = text
-        else:
-            self.custom_context = None
+        self.custom_context = text or None
+        if self.messages and self.messages[0].get("role") == "system":
+            self.messages[0]["content"] = self._build_system_content()
 
     def get_custom_context(self) -> Optional[str]:
         """Return the current custom context, or None if not set."""
@@ -405,15 +406,21 @@ class AgentHarness:
 
     # ── Internal helpers ────────────────────────────────────────────────
 
-    def _build_initial_messages(self, prompt: str) -> List[Dict[str, Any]]:
-        """Build the initial message list for a new conversation."""
+    def _build_system_content(self) -> str:
+        """Build the system prompt content, including CWD and optional custom context."""
         cwd = self.tool_registry.working_dir or os.getcwd()
         cwd_note = f"\nWorking directory: {cwd}. All commands run from this directory."
-        system_content = self.system_prompt + cwd_note
         if self.custom_context:
-            system_content = f"{self.system_prompt}\n\n--- Additional Context ---\n{self.custom_context}\n--- End Additional Context ---\n" + cwd_note
+            return (
+                f"{self.system_prompt}\n\n--- Additional Context ---\n"
+                f"{self.custom_context}\n--- End Additional Context ---\n"
+            ) + cwd_note
+        return self.system_prompt + cwd_note
+
+    def _build_initial_messages(self, prompt: str) -> List[Dict[str, Any]]:
+        """Build the initial message list for a new conversation."""
         return [
-            {"role": "system", "content": system_content},
+            {"role": "system", "content": self._build_system_content()},
             {"role": "user", "content": prompt},
         ]
 

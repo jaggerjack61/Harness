@@ -70,7 +70,50 @@ class TestReadFile:
         f = tmp_path / "lines.txt"
         f.write_text("line1\nline2\nline3\nline4\nline5")
         result = read_file(str(f), offset=2, limit=2)
+        assert result == "line2\nline3\n"
+
+    def test_offset_zero_is_error(self, tmp_path: Path):
+        f = tmp_path / "lines.txt"
+        f.write_text("line1\nline2")
+        result = read_file(str(f), offset=0, limit=1)
+        assert "Error" in result
+        assert "offset" in result.lower()
+
+    def test_negative_offset_is_error(self, tmp_path: Path):
+        f = tmp_path / "lines.txt"
+        f.write_text("line1\nline2")
+        result = read_file(str(f), offset=-1, limit=1)
+        assert "Error" in result
+        assert "offset" in result.lower()
+
+    def test_offset_only(self, tmp_path: Path):
+        f = tmp_path / "lines.txt"
+        f.write_text("line1\nline2\nline3")
+        result = read_file(str(f), offset=2)
+        # Final line has no trailing newline because the source file does not.
         assert result == "line2\nline3"
+
+    def test_limit_only(self, tmp_path: Path):
+        f = tmp_path / "lines.txt"
+        f.write_text("line1\nline2\nline3")
+        result = read_file(str(f), limit=2)
+        assert result == "line1\nline2\n"
+
+    def test_read_with_cwd(self, tmp_path: Path):
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        f = sub / "file.txt"
+        f.write_text("hello")
+        result = read_file("file.txt", cwd=str(sub))
+        assert result == "hello"
+
+    def test_read_with_cwd_and_offset(self, tmp_path: Path):
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        f = sub / "file.txt"
+        f.write_text("a\nb\nc")
+        result = read_file("file.txt", cwd=str(sub), offset=2)
+        assert result == "b\nc"
 
 
 class TestWriteFile:
@@ -92,6 +135,13 @@ class TestWriteFile:
         result = write_file(str(f), "nested")
         assert "success" in result.lower()
         assert f.read_text() == "nested"
+
+    def test_write_with_cwd(self, tmp_path: Path):
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        result = write_file("new.txt", "hello", cwd=str(sub))
+        assert "success" in result.lower()
+        assert (sub / "new.txt").read_text() == "hello"
 
 
 class TestEditFile:
@@ -121,6 +171,22 @@ class TestEditFile:
     def test_returns_error_for_missing_file(self):
         result = edit_file("/nonexistent.txt", [{"oldText": "a", "newText": "b"}])
         assert "Error" in result
+
+    def test_edit_with_cwd(self, tmp_path: Path):
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        f = sub / "file.txt"
+        f.write_text("hello world")
+        result = edit_file("file.txt", [{"oldText": "hello", "newText": "hi"}], cwd=str(sub))
+        assert "success" in result.lower()
+        assert f.read_text() == "hi world"
+
+    def test_edit_handles_non_utf8_bytes(self, tmp_path: Path):
+        f = tmp_path / "binary.txt"
+        f.write_bytes(b"hello \xff world")
+        result = edit_file(str(f), [{"oldText": "hello", "newText": "hi"}])
+        assert "success" in result.lower()
+        assert "hi" in f.read_text(encoding="utf-8", errors="replace")
 
 
 class TestRunBash:
@@ -166,6 +232,26 @@ class TestToolRegistry:
         registry = ToolRegistry()
         with pytest.raises(ValueError, match="Unknown tool"):
             registry.execute("nonexistent", {})
+
+    def test_execute_read_missing_path_returns_error(self):
+        registry = ToolRegistry()
+        result = registry.execute("read", {})
+        assert "Error" in result
+
+    def test_execute_write_missing_content_returns_error(self):
+        registry = ToolRegistry()
+        result = registry.execute("write", {"path": "/tmp/x.txt"})
+        assert "Error" in result
+
+    def test_execute_edit_missing_edits_returns_error(self):
+        registry = ToolRegistry()
+        result = registry.execute("edit", {"path": "/tmp/x.txt"})
+        assert "Error" in result
+
+    def test_execute_bash_missing_command_returns_error(self):
+        registry = ToolRegistry()
+        result = registry.execute("bash", {})
+        assert "Error" in result
 
     def test_execute_with_working_dir(self, tmp_path: Path):
         registry = ToolRegistry(working_dir=str(tmp_path))

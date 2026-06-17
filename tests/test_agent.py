@@ -47,6 +47,49 @@ class TestAgentHarnessInit:
         assert agent.reasoning_effort is None
 
 
+class TestCustomContext:
+    def test_get_and_set_custom_context(self):
+        agent = AgentHarness(model="deepseek-v4-pro")
+        assert agent.get_custom_context() is None
+        agent.set_custom_context("Extra info")
+        assert agent.get_custom_context() == "Extra info"
+
+    def test_set_custom_context_clears_with_empty_string(self):
+        agent = AgentHarness(model="deepseek-v4-pro")
+        agent.set_custom_context("Extra info")
+        assert agent.get_custom_context() == "Extra info"
+        agent.set_custom_context("")
+        assert agent.get_custom_context() is None
+
+    def test_build_system_content_includes_context(self):
+        agent = AgentHarness(model="deepseek-v4-pro", system_prompt="Be helpful.")
+        agent.set_custom_context("Project: harness")
+        content = agent._build_system_content()
+        assert "Be helpful." in content
+        assert "Project: harness" in content
+        assert "Additional Context" in content
+
+    def test_set_custom_context_updates_existing_system_message(self):
+        agent = AgentHarness(model="deepseek-v4-pro")
+        agent.run = lambda *a, **k: None  # avoid API calls
+        # Simulate an existing conversation
+        agent.messages = agent._build_initial_messages("Hello")
+        original_content = agent.messages[0]["content"]
+        assert "Additional Context" not in original_content
+
+        agent.set_custom_context("New context")
+        assert "New context" in agent.messages[0]["content"]
+        assert agent.messages[0]["role"] == "system"
+
+    def test_clear_history_keeps_custom_context(self):
+        agent = AgentHarness(model="deepseek-v4-pro")
+        agent.set_custom_context("Keep me")
+        agent.messages = [{"role": "user", "content": "old"}]
+        agent.clear_history()
+        assert agent.messages == []
+        assert agent.get_custom_context() == "Keep me"
+
+
 class TestMessageBuilding:
     def test_builds_initial_messages_with_system_prompt(self):
         agent = AgentHarness(model="deepseek-v4-pro", system_prompt="Be helpful.")

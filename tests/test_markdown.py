@@ -123,6 +123,12 @@ class TestMarkdownToPlain:
         assert "A short line." in result_narrow
         assert "A short line." in result_wide
 
+    def test_plain_fallback_on_markup_error(self):
+        """markdown_to_plain should survive Rich markup errors."""
+        text = "Look at [/this] pattern."
+        result = markdown_to_plain(text)
+        assert "this" in result
+
 
 class TestRenderMarkdown:
     """Test rendering markdown to a console."""
@@ -141,6 +147,14 @@ class TestRenderMarkdown:
         render_markdown("```python\nx = 42\n```", console=console)
         output = console.file.getvalue()
         assert "x = 42" in output
+
+    def test_render_falls_back_on_markup_error(self):
+        """Unmatched Rich markup patterns should not crash rendering."""
+        console = Console(file=StringIO(), width=100, force_terminal=False, no_color=True)
+        # Text with an unmatched closing tag that Rich would normally try to interpret.
+        render_markdown("See [/ Additional Context] for details.", console=console)
+        output = console.file.getvalue()
+        assert "Additional Context" in output
 
     def test_creates_default_console_when_none_provided(self):
         """When no console is passed, render_markdown creates one and prints to stdout."""

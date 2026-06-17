@@ -23,9 +23,33 @@ class MockStreamChunk:
         self.usage = usage
 
 
+def _make_tool_call_chunk(index, tc_id, name, arguments, content=None):
+    """Build a stream chunk carrying a tool-call delta."""
+    choice = MagicMock()
+    delta = MagicMock()
+    delta.content = content
+    delta.reasoning_content = None
+    delta.thinking = None
+    delta.thought = None
+    func = MagicMock()
+    func.name = name
+    func.arguments = arguments
+    tc_delta = MagicMock()
+    tc_delta.index = index
+    tc_delta.id = tc_id
+    tc_delta.function = func
+    delta.tool_calls = [tc_delta]
+    choice.delta = delta
+    choice.finish_reason = "tool_calls"
+    chunk = MagicMock()
+    chunk.choices = [choice]
+    chunk.usage = None
+    return chunk
+
+
 class TestStreamingParsing:
     """Test the _process_stream method."""
-    
+
     def setup_method(self):
         self.agent = AgentHarness(model="test-model", api_key="sk-test")
     
@@ -77,18 +101,203 @@ class TestStreamingParsing:
     def test_stream_empty_response(self):
         """Test streaming with no content."""
         chunks = []
-        
+
         text, reasoning, tool_calls, usage = self.agent._process_stream(iter(chunks))
-        
+
         assert text is None
         assert reasoning is None
         assert tool_calls == []
         assert usage is None
 
+    def test_stream_with_tool_call(self):
+        """Test streaming a response that contains a tool call."""
+        chunks = [
+            _make_tool_call_chunk(0, "call_1", "read", None),
+            _make_tool_call_chunk(0, None, None, '{"path": "/tmp/x.txt"}'),
+        ]
+
+        text, reasoning, tool_calls, usage = self.agent._process_stream(iter(chunks))
+
+        assert text is None
+        assert tool_calls == [
+            {"id": "call_1", "name": "read", "arguments": {"path": "/tmp/x.txt"}}
+        ]
+
+    def test_stream_with_multiple_tool_calls(self):
+        """Test streaming multiple tool calls in a single response."""
+        chunks = [
+            _make_tool_call_chunk(0, "c1", "read", '{"path": "/a.txt"}'),
+            _make_tool_call_chunk(1, "c2", "bash", '{"command": "ls"}'),
+        ]
+
+        text, reasoning, tool_calls, usage = self.agent._process_stream(iter(chunks))
+
+        assert len(tool_calls) == 2
+        assert tool_calls[0] == {"id": "c1", "name": "read", "arguments": {"path": "/a.txt"}}
+        assert tool_calls[1] == {"id": "c2", "name": "bash", "arguments": {"command": "ls"}}
+
+    def test_stream_malformed_tool_arguments(self):
+        """Malformed JSON tool arguments fall back to an empty dict."""
+        chunks = [
+            _make_tool_call_chunk(0, "call_1", "read", "not json"),
+        ]
+
+        text, reasoning, tool_calls, usage = self.agent._process_stream(iter(chunks))
+
+        assert tool_calls[0]["arguments"] == {}
+
+    def test_stream_extracts_usage(self):
+        """Test that usage information from the stream is returned."""
+        usage_mock = MagicMock()
+        usage_mock.prompt_tokens = 42
+        usage_mock.completion_tokens = 7
+        usage_mock.prompt_tokens_details = None
+
+        chunk = MagicMock()
+        choice = MagicMock()
+        delta = MagicMock()
+        delta.content = "Hi"
+        delta.tool_calls = None
+        delta.reasoning_content = None
+        choice.delta = delta
+        choice.finish_reason = "stop"
+        chunk.choices = [choice]
+        chunk.usage = usage_mock
+
+        text, reasoning, tool_calls, usage = self.agent._process_stream(iter([chunk]))
+
+        assert usage == {
+            "prompt_tokens": 42,
+            "completion_tokens": 7,
+            "prompt_tokens_details": {},
+        }
+
+    def test_stream_reasoning_via_thinking_field(self):
+        """Test that reasoning can arrive in the thinking field."""
+        chunk = MagicMock()
+        choice = MagicMock()
+        delta = MagicMock()
+        delta.content = "Answer"
+        delta.tool_calls = None
+        delta.reasoning_content = None
+        delta.thinking = "Step one"
+        delta.thought = None
+        choice.delta = delta
+        choice.finish_reason = "stop"
+        chunk.choices = [choice]
+        chunk.usage = None
+
+        text, reasoning, tool_calls, usage = self.agent._process_stream(iter([chunk]))
+
+        assert text == "Answer"
+        assert reasoning == "Step one"
+
+
+class TestStreamingRun:
+    """Test AgentHarness.run() in streaming mode."""
+
+    @patch("harness.agent.OpenAI")
+    def test_streaming_text_response_emits_text_end(self, mock_openai):
+        """A simple streaming text response emits text_delta and text_end."""
+        mock_client = MagicMock()
+        mock_openai.return_value = mock_client
+
+        def make_stream():
+            for word in ["Hello", " world", "!"]:
+                chunk = MagicMock()
+                choice = MagicMock()
+                delta = MagicMock()
+                delta.content = word
+                delta.tool_calls = None
+                delta.reasoning_content = None
+                choice.delta = delta
+                choice.finish_reason = "stop"
+                chunk.choices = [choice]
+                chunk.usage = None
+                yield chunk
+
+        mock_client.chat.completions.create.return_value = make_stream()
+
+        agent = AgentHarness(model="test-model", api_key="sk-test")
+        events = []
+        result = agent.run("Hi", callback=events.append, stream=True)
+
+        assert result == "Hello world!"
+        deltas = [e for e in events if e["type"] == "text_delta"]
+        assert [e["content"] for e in deltas] == ["Hello", " world", "!"]
+        assert events[-1] == {"type": "text_end", "content": "Hello world!"}
+
+    @patch("harness.agent.OpenAI")
+    def test_streaming_text_response_emits_tokens_event(self, mock_openai):
+        """Token usage from the final stream chunk is reported."""
+        mock_client = MagicMock()
+        mock_openai.return_value = mock_client
+
+        usage_mock = MagicMock()
+        usage_mock.prompt_tokens = 10
+        usage_mock.completion_tokens = 5
+        usage_mock.prompt_tokens_details = None
+
+        def make_stream():
+            chunk = MagicMock()
+            choice = MagicMock()
+            delta = MagicMock()
+            delta.content = "Done"
+            delta.tool_calls = None
+            delta.reasoning_content = None
+            choice.delta = delta
+            choice.finish_reason = "stop"
+            chunk.choices = [choice]
+            chunk.usage = usage_mock
+            yield chunk
+
+        mock_client.chat.completions.create.return_value = make_stream()
+
+        agent = AgentHarness(model="test-model", api_key="sk-test")
+        events = []
+        agent.run("Hi", callback=events.append, stream=True)
+
+        token_events = [e for e in events if e["type"] == "tokens"]
+        assert len(token_events) == 1
+        assert token_events[0]["input_tokens"] == 10
+        assert token_events[0]["output_tokens"] == 5
+
+    @patch("harness.agent.OpenAI")
+    def test_streaming_tool_call_loop(self, mock_openai):
+        """Streaming responses with tool calls execute tools and continue."""
+        mock_client = MagicMock()
+        mock_openai.return_value = mock_client
+
+        def first_stream():
+            yield _make_tool_call_chunk(0, "call_1", "bash", '{"command": "echo hello"}')
+
+        def second_stream():
+            chunk = MagicMock()
+            choice = MagicMock()
+            delta = MagicMock()
+            delta.content = "All done"
+            delta.tool_calls = None
+            delta.reasoning_content = None
+            choice.delta = delta
+            choice.finish_reason = "stop"
+            chunk.choices = [choice]
+            chunk.usage = None
+            yield chunk
+
+        mock_client.chat.completions.create.side_effect = [first_stream(), second_stream()]
+
+        agent = AgentHarness(model="test-model", api_key="sk-test")
+        events = []
+        result = agent.run("Say hello", callback=events.append, stream=True)
+
+        assert result == "All done"
+        assert any(e["type"] == "tool_call" and e["name"] == "bash" for e in events)
+        assert any(e["type"] == "tool_result" for e in events)
+
 
 class TestStreamingCLI:
     """Test CLI streaming output."""
-    
+
     @patch("harness.cli.AgentHarness")
     @patch("harness.cli.input")
     def test_stream_flag_enabled(self, mock_input, mock_harness):
