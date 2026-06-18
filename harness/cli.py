@@ -8,6 +8,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from typing import Any, List, Optional
 
 import httpx
@@ -35,7 +36,15 @@ _response_text: str = ""  # accumulated response text for the live display
 _response_complete: str = ""  # newline-terminated prefix of _response_text (Markdown-parsed)
 _response_md: Optional[Any] = None  # cached Markdown renderable for the complete portion
 _response_renderable: Optional[Any] = None  # current response renderable in Live
-_token_text: Optional[Text] = None  # current token status bar renderable
+_token_text: Optional[Any] = None  # current token status bar renderable
+_last_token_event: Optional[dict] = None  # last token event, for final static bar
+_agent_active: bool = False  # whether the agent is currently generating
+# Braille spinner frames shown as the leading indicator while the agent is
+# in action. Live's auto-refresh re-renders the bar, so picking the frame from
+# the current time yields a smooth animation.
+_SPINNER_FRAMES: List[str] = [
+    "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏",
+]
 # Thinking-streaming state. Reasoning is emitted as many small deltas that are
 # not line-aligned. Completed lines are flushed to scrolling output (above the
 # live region) so they persist; the trailing partial line is mirrored into the
@@ -50,6 +59,7 @@ def _reset_stream_state() -> None:
     global _streamed_any, _response_text, _response_complete, _response_md
     global _response_renderable, _token_text
     global _thinking_line_buf, _thinking_first_line, _thinking_renderable
+    global _agent_active, _last_token_event
     _streamed_any = False
     _response_text = ""
     _response_complete = ""
@@ -59,6 +69,10 @@ def _reset_stream_state() -> None:
     _thinking_line_buf = ""
     _thinking_first_line = True
     _thinking_renderable = None
+    # A new agent turn is starting: mark the agent as active so the status bar
+    # shows an animated indicator instead of the static icon.
+    _agent_active = True
+    _last_token_event = None
 
 
 def _rebuild_response_md() -> None:
@@ -383,12 +397,17 @@ def _on_event(event: dict) -> None:
             print()
 
 
-def _build_token_text(event: dict, max_width: Optional[int] = None) -> Text:
+def _build_token_text(event: dict, max_width: Optional[int] = None,
+                       icon_override: Optional[tuple] = None) -> Text:
     """Build a Rich Text renderable for the live token status bar.
 
     If ``max_width`` is provided, the status line is progressively compacted
     (fewer spaces, optional fields dropped) so that it fits within the
     terminal without being truncated.
+
+    If ``icon_override`` is given, it replaces the default leading ``📊`` icon
+    (a ``(text, style)`` tuple). This is used to swap in an animated spinner
+    frame while the agent is generating.
     """
     input_tk = event.get("input_tokens", 0)
     output_tk = event.get("output_tokens", 0)
@@ -401,7 +420,7 @@ def _build_token_text(event: dict, max_width: Optional[int] = None) -> Text:
     reasoning_effort = event.get("reasoning_effort")
 
     # Required fields: icon, model (if known), core counters, and turn delta.
-    required: List[tuple] = [("📊", "bold")]
+    required: List[tuple] = [icon_override if icon_override is not None else ("📊", "bold")]
     if model:
         required.append((model, "bold magenta"))
     required.extend([
@@ -477,11 +496,40 @@ def _build_token_text(event: dict, max_width: Optional[int] = None) -> Text:
     return _assemble(candidates[-1][0], candidates[-1][1])
 
 
+class _AnimatedTokenBar:
+    """Token status bar whose leading icon animates while the agent is active.
+
+    Rich's ``Live`` auto-refresh thread re-renders this object periodically, so
+    selecting the spinner frame from the current monotonic time produces a
+    smooth animation. When ``active`` is False the static ``📊`` icon is shown
+    instead (e.g. once the agent has finished generating).
+    """
+
+    def __init__(self, event: dict, max_width: Optional[int] = None,
+                 active: bool = True) -> None:
+        self._event = event
+        self._max_width = max_width
+        self._active = active
+
+    def __rich__(self) -> Text:
+        if self._active:
+            frame = _SPINNER_FRAMES[
+                int(time.monotonic() * 8) % len(_SPINNER_FRAMES)
+            ]
+            icon = (frame, "bold cyan")
+        else:
+            icon = ("📊", "bold")
+        return _build_token_text(self._event, max_width=self._max_width,
+                                 icon_override=icon)
+
+
 def _print_tokens(event: dict) -> None:
     """Update the live token status bar via Rich, or print directly if no live display."""
-    global _live, _console, _token_text
+    global _live, _console, _token_text, _last_token_event
+    _last_token_event = event
     max_width = _console.width if _console is not None else None
-    _token_text = _build_token_text(event, max_width=max_width)
+    _token_text = _AnimatedTokenBar(event, max_width=max_width,
+                                    active=_agent_active)
     if _live is not None:
         _update_live()
     else:
@@ -492,9 +540,20 @@ def _print_tokens(event: dict) -> None:
 
 
 def _clear_status_bar() -> None:
-    """Stop the live display and clear the status bar."""
-    global _live
+    """Stop the live display and clear the status bar.
+
+    Before stopping, mark the agent inactive and refresh the bar once so the
+    final, persistent frame shows the static ``📊`` icon rather than a frozen
+    spinner frame.
+    """
+    global _live, _agent_active, _token_text
+    _agent_active = False
     if _live is not None:
+        if _last_token_event is not None:
+            max_width = _console.width if _console is not None else None
+            _token_text = _AnimatedTokenBar(_last_token_event,
+                                            max_width=max_width, active=False)
+            _update_live()
         _live.stop()
         _live = None
 

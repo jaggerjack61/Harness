@@ -685,6 +685,102 @@ class TestBuildTokenText:
         text = _build_token_text(event)
         assert text.no_wrap is True
 
+    def test_default_icon_is_chart(self):
+        """The default leading icon is the static chart emoji."""
+        from harness.cli import _build_token_text
+        event = {
+            "type": "tokens",
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "total_tokens": 150,
+            "cached_tokens": 0,
+            "turn_input": 100,
+            "turn_output": 50,
+            "turn_cached": 0,
+            "model": "gpt-4o",
+        }
+        text = _build_token_text(event)
+        assert text.plain.startswith("📊")
+
+    def test_icon_override_replaces_chart(self):
+        """An explicit icon_override replaces the default chart icon."""
+        from harness.cli import _build_token_text
+        event = {
+            "type": "tokens",
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "total_tokens": 150,
+            "cached_tokens": 0,
+            "turn_input": 100,
+            "turn_output": 50,
+            "turn_cached": 0,
+            "model": "gpt-4o",
+        }
+        text = _build_token_text(event, icon_override=("⠋", "bold cyan"))
+        assert not text.plain.startswith("📊")
+        assert text.plain.startswith("⠋")
+
+
+class TestAnimatedTokenBar:
+    """The status bar icon should animate while the agent is active."""
+
+    def _event(self):
+        return {
+            "type": "tokens",
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "total_tokens": 150,
+            "cached_tokens": 0,
+            "turn_input": 100,
+            "turn_output": 50,
+            "turn_cached": 0,
+            "model": "glm-5.2",
+        }
+
+    def test_active_renders_spinner_frame(self):
+        from harness.cli import _AnimatedTokenBar, _SPINNER_FRAMES
+        bar = _AnimatedTokenBar(self._event(), max_width=None, active=True)
+        rendered = bar.__rich__().plain
+        assert rendered[0] in _SPINNER_FRAMES
+        assert "📊" not in rendered
+
+    def test_inactive_renders_chart(self):
+        from harness.cli import _AnimatedTokenBar
+        bar = _AnimatedTokenBar(self._event(), max_width=None, active=False)
+        rendered = bar.__rich__().plain
+        assert rendered.startswith("📊")
+
+    def test_active_frame_changes_over_time(self):
+        """Different points in time should yield (eventually) different frames."""
+        import time as _time
+        from harness.cli import _AnimatedTokenBar, _SPINNER_FRAMES
+        bar = _AnimatedTokenBar(self._event(), max_width=None, active=True)
+        frames = set()
+        for _ in range(len(_SPINNER_FRAMES) * 2):
+            frames.add(bar.__rich__().plain[0])
+            _time.sleep(0.13)
+        assert len(frames) > 1
+
+    def test_reset_stream_state_marks_active(self):
+        import harness.cli as cli
+        cli._agent_active = False
+        cli._reset_stream_state()
+        assert cli._agent_active is True
+
+    def test_clear_status_bar_marks_inactive_and_shows_chart(self):
+        """Stopping the live display should leave the static icon on the bar."""
+        import harness.cli as cli
+        cli._console = None
+        cli._live = MagicMock()
+        cli._agent_active = True
+        cli._last_token_event = self._event()
+        cli._token_text = None
+        cli._clear_status_bar()
+        assert cli._agent_active is False
+        # The final stored renderable should show the static chart icon.
+        assert cli._token_text is not None
+        assert cli._token_text.__rich__().plain.startswith("📊")
+
 
 def _make_fake_application(key_sequence):
     """Build a fake prompt_toolkit Application that replays a key sequence."""
