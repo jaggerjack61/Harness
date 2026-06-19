@@ -819,13 +819,31 @@ def _prompt_reasoning_selection(current_effort: Optional[str]) -> Optional[str]:
         return _prompt_reasoning_selection_numeric(current_effort)
 
 
+def _disp_width(s: str) -> int:
+    """Return the terminal display width of *s* (handles wide chars like emoji)."""
+    try:
+        from wcwidth import wcswidth
+        w = wcswidth(s)
+        if w >= 0:
+            return w
+    except ImportError:
+        pass
+    return len(s)
+
+
+def _pad_to_width(s: str, width: int) -> str:
+    """Pad *s* with trailing spaces so its display width equals *width*."""
+    pad = width - _disp_width(s)
+    return s + (" " * max(0, pad))
+
+
 def _build_welcome_box(model: str, reasoning_effort: str, context_window: int, working_dir: str, streaming: bool = True) -> str:
-    """Build the welcome box with dynamic width based on content."""
+    """Build the welcome box with dynamic width based on content display width."""
     ctx_str = f"{context_window:,} tokens"
     cwd_display = working_dir
     stream_str = "on" if streaming else "off"
 
-    # Collect all content lines (without borders) to calculate max width
+    # Collect all content lines (without borders) to calculate max display width
     lines = [
         "🤖 Nasa Level Genius Agent",
         f"Model:           {model}",
@@ -838,17 +856,16 @@ def _build_welcome_box(model: str, reasoning_effort: str, context_window: int, w
         "           /stream  /context  /context show  /context clear",
     ]
 
-    # Calculate box width: max content length + padding (2 left + 2 right)
-    max_len = max(len(line) for line in lines)
-    inner_w = max_len + 4  # 2 spaces padding on each side
+    # Calculate box width: max display width + padding (2 left + 2 right)
+    max_w = max(_disp_width(line) for line in lines)
+    inner_w = max_w + 4  # 2 spaces padding on each side
 
     # Build the box
     result = []
     result.append(f"╔{'═' * inner_w}╗")
     for line in lines:
-        # Pad each line to inner_w (2 left pad + content + right pad)
-        padded = f"  {line}"
-        padded = f"{padded:<{inner_w}s}"
+        # 2-space left pad, content, then right-pad to inner_w display width
+        padded = _pad_to_width(f"  {line}", inner_w)
         result.append(f"║{padded}║")
     result.append(f"╚{'═' * inner_w}╝")
     return "\n".join(result)

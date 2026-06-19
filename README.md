@@ -77,17 +77,17 @@ python -m harness
 Then just type a prompt and watch the agent work!
 
 ```
-╔════════════════════════════════════════════════════════════════════════╗
-║  🤖 Nasa Level Genius Agent                                           ║
-║  Model:           deepseek-v4-pro                                     ║
-║  Reasoning:       high                                                ║
-║  Context window:  1,000,000 tokens                                    ║
-║  Streaming:       on                                                  ║
-║  CWD:             my-project                                          ║
-║  ────────────────────────────────────────                             ║
-║  Commands:  /exit  /clear  /models  /reasoning                        ║
-║             /stream  /context  /context show  /context clear          ║
-╚════════════════════════════════════════════════════════════════════════╝
+╔═══════════════════════════════════════════════════════════════╗
+║  🤖 Nasa Level Genius Agent                                   ║
+║  Model:           deepseek-v4-pro                             ║
+║  Reasoning:       high                                        ║
+║  Context window:  1,000,000 tokens                            ║
+║  Streaming:       on                                          ║
+║  CWD:             my-project                                  ║
+║  ────────────────────────────────────────                     ║
+║  Commands:  /exit  /clear  /models  /reasoning                ║
+║             /stream  /context  /context show  /context clear  ║
+╚═══════════════════════════════════════════════════════════════╝
 
 📦 42 models loaded. Use /models to switch.
 
