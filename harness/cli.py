@@ -424,9 +424,20 @@ def _on_event(event: dict) -> None:
             cmd = args.get("command", "")
             cmd_lines = cmd.splitlines()
             if cmd_lines:
-                print(f"\n  🔧 {BLUE}{cmd_lines[0]}{RESET}", flush=True)
-                for line in cmd_lines[1:]:
-                    print(f"     {BLUE}{line}{RESET}", flush=True)
+                # Wrap long commands so continuation rows keep the indent
+                # prefix instead of snapping back to the far-left margin
+                # (which made long single-line commands unreadable).
+                first_prefix = "  🔧 "
+                rest_prefix = "     "
+                print(flush=True)
+                first_logical = True
+                for line in cmd_lines:
+                    prefix = first_prefix if first_logical else rest_prefix
+                    chunks = _wrap_line(line, _available_width(cell_len(prefix)))
+                    for i, chunk in enumerate(chunks):
+                        chunk_prefix = prefix if (i == 0 and first_logical) else rest_prefix
+                        print(f"{chunk_prefix}{BLUE}{chunk}{RESET}", flush=True)
+                    first_logical = False
         elif name == "write":
             path = args.get("path", "")
             content = args.get("content", "")
@@ -459,16 +470,22 @@ def _on_event(event: dict) -> None:
         color = GREEN if name in ("write", "edit") else ""
         lines = result.splitlines()
         print(f"     ├─ result:", flush=True)
+        # Wrap long lines to the terminal width so that continuation rows
+        # keep the ``│ `` prefix instead of snapping back to the far-left
+        # margin (which made indented / long file content unreadable).
+        result_prefix = "     │ "
+        wrap_width = _available_width(cell_len(result_prefix))
         if len(lines) > 5:
             hidden = len(lines) - 5
             total = len(lines)
-            shown = lines[:5]
-            indented = "\n".join(f"     │ {color}{line}{RESET}" for line in shown)
-            print(indented, flush=True)
+            for line in lines[:5]:
+                for chunk in _wrap_line(line, wrap_width):
+                    print(f"{result_prefix}{color}{chunk}{RESET}", flush=True)
             print(f"     └─ {color}... truncated: {hidden} of {total} lines hidden (full output received by agent){RESET}", flush=True)
         else:
-            indented = "\n".join(f"     │ {color}{line}{RESET}" for line in lines)
-            print(indented, flush=True)
+            for line in lines:
+                for chunk in _wrap_line(line, wrap_width):
+                    print(f"{result_prefix}{color}{chunk}{RESET}", flush=True)
 
     elif etype == "text":
         # Don't print text events here — the final answer is printed by main()
