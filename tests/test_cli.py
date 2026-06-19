@@ -161,7 +161,7 @@ class TestOnEvent:
         cli._live = None
         cli._no_markdown = False
         cli._streamed_any = False
-        cli._response_text = ""
+        cli._response_buffer.reset()
         cli._response_complete = ""
         cli._response_md = None
         cli._response_renderable = None
@@ -525,6 +525,25 @@ class TestAgentResultNotTruncated:
 
 
 class TestCliMain:
+    @patch("harness.cli._fetch_models")
+    @patch("harness.cli.input")
+    def test_startup_does_not_block_on_model_fetch(self, mock_input, mock_fetch):
+        """main() must not block on the model fetch — it runs in the background."""
+        import time
+        from harness.cli import main
+
+        def slow_fetch(*a, **k):
+            time.sleep(2)
+            return ["m1", "m2"]
+
+        mock_fetch.side_effect = slow_fetch
+        mock_input.side_effect = ["/exit"]
+
+        t = time.perf_counter()
+        main(["--api-key", "sk-test"])
+        dt = time.perf_counter() - t
+        assert dt < 1.0, f"main() blocked {dt:.2f}s on model fetch"
+
     @patch("harness.cli.AgentHarness")
     @patch("harness.cli.input")
     def test_runs_without_api_key_arg(self, mock_input, mock_harness):
@@ -810,6 +829,39 @@ class TestBuildTokenText:
         text = _build_token_text(event)
         assert text.no_wrap is True
 
+    def test_narrow_width_builds_single_text(self):
+        """A narrow terminal must produce a fitting bar with one Text build."""
+        import harness.cli as cli
+        from rich.text import Text as RealText
+
+        event = {
+            "type": "tokens",
+            "input_tokens": 36103,
+            "output_tokens": 674,
+            "total_tokens": 36777,
+            "cached_tokens": 20096,
+            "turn_input": 15901,
+            "turn_output": 393,
+            "turn_cached": 0,
+            "context_window": 1000000,
+            "model": "mimo-v2.5-pro",
+            "reasoning_effort": "high",
+        }
+
+        builds = []
+
+        class CountingText(RealText):
+            def __init__(self, *a, **k):
+                builds.append(1)
+                super().__init__(*a, **k)
+
+        with patch.object(cli, "Text", CountingText):
+            text = cli._build_token_text(event, max_width=45)
+        # Must fit the narrow width and be built from exactly one Text object.
+        from rich.cells import cell_len
+        assert cell_len(text.plain) <= 45
+        assert len(builds) == 1
+
     def test_default_icon_is_chart(self):
         """The default leading icon is the static chart emoji."""
         from harness.cli import _build_token_text
@@ -1005,3 +1057,91 @@ class TestReasoningPrompt:
             REASONING_OPTIONS, "high", title="🧠 Reasoning effort",
             current_label="Current effort",
         )
+
+
+class TestResponseBuffer:
+    """The streamed-response buffer must accumulate in O(1) per delta."""
+
+    def test_append_and_partial_no_newline(self):
+        from harness.cli import _ResponseBuffer
+        buf = _ResponseBuffer()
+        buf.append("hello ")
+        buf.append("world")
+        assert buf.complete == ""
+        assert buf.partial == "hello world"
+        assert buf.text == "hello world"
+
+    def test_complete_line_folded_on_newline(self):
+        from harness.cli import _ResponseBuffer
+        buf = _ResponseBuffer()
+        buf.append("## Heading\n")
+        assert buf.complete == "## Heading\n"
+        assert buf.partial == ""
+
+    def test_hybrid_complete_plus_partial(self):
+        from harness.cli import _ResponseBuffer
+        buf = _ResponseBuffer()
+        buf.append("## Heading\npartial ")
+        buf.append("text")
+        assert buf.complete == "## Heading\n"
+        assert buf.partial == "partial text"
+
+    def test_multiple_lines(self):
+        from harness.cli import _ResponseBuffer
+        buf = _ResponseBuffer()
+        buf.append("line1\nline2\nline3")
+        assert buf.complete == "line1\nline2\n"
+        assert buf.partial == "line3"
+
+    def test_newline_inside_chunk(self):
+        from harness.cli import _ResponseBuffer
+        buf = _ResponseBuffer()
+        buf.append("a\nb\nc")
+        assert buf.complete == "a\nb\n"
+        assert buf.partial == "c"
+
+    def test_set_complete_finalizes(self):
+        from harness.cli import _ResponseBuffer
+        buf = _ResponseBuffer()
+        buf.append("partial")
+        buf.set_complete("final answer\n")
+        assert buf.complete == "final answer\n"
+        assert buf.partial == ""
+        assert buf.text == "final answer\n"
+
+    def test_reset_clears_state(self):
+        from harness.cli import _ResponseBuffer
+        buf = _ResponseBuffer()
+        buf.append("x\ny")
+        buf.reset()
+        assert buf.complete == ""
+        assert buf.partial == ""
+        assert buf.text == ""
+
+    def test_empty_append_is_noop(self):
+        from harness.cli import _ResponseBuffer
+        buf = _ResponseBuffer()
+        buf.append("")
+        assert buf.text == ""
+        buf.append("a")
+        buf.append("")
+        assert buf.text == "a"
+
+    def test_append_scales_linearly(self):
+        """Appending many chunks must scale linearly, not quadratically."""
+        import time
+        from harness.cli import _ResponseBuffer
+
+        def time_n(n):
+            buf = _ResponseBuffer()
+            t = time.perf_counter()
+            for _ in range(n):
+                buf.append("ab")
+            _ = buf.partial
+            return time.perf_counter() - t
+
+        t_small = time_n(2000)
+        t_large = time_n(8000)
+        ratio = t_large / t_small if t_small > 0 else 0
+        # Linear ~4x, quadratic ~16x. Threshold 8 cleanly separates.
+        assert ratio < 8, f"buffer scaled super-linearly: {t_small:.4f}s -> {t_large:.4f}s (ratio {ratio:.1f})"

@@ -22,6 +22,36 @@ When searching or listing files, limit output with Select-Object -First, | head,
 Be concise and helpful."""
 
 
+# Reasoning/thinking field names providers use, in precedence order. Shared by
+# the streaming-delta and full-message extraction paths (DRY).
+_REASONING_ATTRS: Tuple[str, ...] = ("reasoning_content", "thinking", "thought")
+_REASONING_EXTRA_KEYS: Tuple[str, ...] = (
+    "reasoning_content",
+    "reasoning",
+    "thinking",
+    "thought",
+)
+
+
+def _extract_reasoning_fields(obj: Any) -> Optional[str]:
+    """Extract reasoning/thinking content from a delta or message object.
+
+    Checks the known attribute names directly, then ``model_extra`` (Pydantic v2
+    extra-fields passthrough). Returns the first non-empty string found, or None.
+    """
+    for attr in _REASONING_ATTRS:
+        val = getattr(obj, attr, None)
+        if isinstance(val, str) and val:
+            return val
+    model_extra = getattr(obj, "model_extra", None)
+    if isinstance(model_extra, dict):
+        for key in _REASONING_EXTRA_KEYS:
+            val = model_extra.get(key)
+            if isinstance(val, str) and val:
+                return val
+    return None
+
+
 class AgentHarness:
     """An AI agent that can use read/write/edit/bash tools via an OpenAI-compatible API.
 
@@ -118,69 +148,28 @@ class AgentHarness:
                 response_stream = self.client.chat.completions.create(**create_kwargs)
                 text, reasoning, tool_calls, usage = self._process_stream(response_stream, callback)
 
-                # Track token usage per-turn
-                turn_input = 0
-                turn_output = 0
-                turn_cached = 0
+                # Track token usage per-turn and emit live stats event.
+                turn_input = turn_output = turn_cached = 0
                 if usage:
                     turn_input = usage.get('prompt_tokens', 0) or 0
                     turn_output = usage.get('completion_tokens', 0) or 0
-                    self.input_tokens += turn_input
-                    self.output_tokens += turn_output
                     pts = usage.get('prompt_tokens_details') or {}
                     turn_cached = pts.get('cached_tokens', 0) or 0
-                    self.cached_tokens += turn_cached
-
-                # Emit live token stats event
-                if callback:
-                    callback({
-                        "type": "tokens",
-                        "input_tokens": self.input_tokens,
-                        "output_tokens": self.output_tokens,
-                        "total_tokens": self.input_tokens + self.output_tokens,
-                        "cached_tokens": self.cached_tokens,
-                        "turn_input": turn_input,
-                        "turn_output": turn_output,
-                        "turn_cached": turn_cached,
-                        "context_window": self.context_window,
-                        "model": self.model,
-                        "reasoning_effort": self.reasoning_effort,
-                    })
+                self._track_and_emit_tokens(turn_input, turn_output, turn_cached, callback)
             else:
                 # Non-streaming mode
                 response = self.client.chat.completions.create(**create_kwargs)
 
-                # Track token usage per-turn
-                turn_input = 0
-                turn_output = 0
-                turn_cached = 0
+                # Track token usage per-turn and emit live stats event.
+                turn_input = turn_output = turn_cached = 0
                 if hasattr(response, 'usage') and response.usage:
                     turn_input = response.usage.prompt_tokens or 0
                     turn_output = response.usage.completion_tokens or 0
-                    self.input_tokens += turn_input
-                    self.output_tokens += turn_output
-                    # Extract cache hit info if available
                     if response.usage.prompt_tokens_details:
                         pts = response.usage.prompt_tokens_details
                         if hasattr(pts, 'cached_tokens') and pts.cached_tokens:
                             turn_cached = pts.cached_tokens
-                            self.cached_tokens += turn_cached
-
-                # Emit live token stats event
-                if callback:
-                    callback({
-                        "type": "tokens",
-                        "input_tokens": self.input_tokens,
-                        "output_tokens": self.output_tokens,
-                        "total_tokens": self.input_tokens + self.output_tokens,
-                        "cached_tokens": self.cached_tokens,
-                        "turn_input": turn_input,
-                        "turn_output": turn_output,
-                        "turn_cached": turn_cached,
-                        "context_window": self.context_window,
-                        "model": self.model,
-                        "reasoning_effort": self.reasoning_effort,
-                    })
+                self._track_and_emit_tokens(turn_input, turn_output, turn_cached, callback)
 
                 text, reasoning, tool_calls = self._parse_response(response)
 
@@ -282,8 +271,8 @@ class AgentHarness:
         Returns:
             A tuple of (text_content, reasoning_content, list_of_tool_calls, usage_dict).
         """
-        full_text = ""
-        full_reasoning = ""
+        text_chunks: List[str] = []
+        reasoning_chunks: List[str] = []
         thinking_open = False  # whether a thinking_delta block is currently open
         tool_calls_map: Dict[int, Dict[str, Any]] = {}  # index -> {id, name, arguments_str}
         usage = None
@@ -315,7 +304,7 @@ class AgentHarness:
 
             # Handle text content
             if delta.content:
-                full_text += delta.content
+                text_chunks.append(delta.content)
                 if callback:
                     callback({
                         "type": "text_delta",
@@ -327,7 +316,7 @@ class AgentHarness:
             # the CLI can show reasoning progress as it arrives.
             reasoning_delta = self._extract_reasoning_delta(delta)
             if reasoning_delta:
-                full_reasoning += reasoning_delta
+                reasoning_chunks.append(reasoning_delta)
                 thinking_open = True
                 if callback:
                     callback({
@@ -377,8 +366,8 @@ class AgentHarness:
 
         _close_thinking()
 
-        text = full_text if full_text else None
-        reasoning = full_reasoning if full_reasoning else None
+        text = "".join(text_chunks) if text_chunks else None
+        reasoning = "".join(reasoning_chunks) if reasoning_chunks else None
 
         return text, reasoning, tool_calls, usage
 
@@ -388,23 +377,9 @@ class AgentHarness:
         Different providers return reasoning in different fields:
         - OpenAI o-series / DeepSeek: delta.reasoning_content
         - Some providers: delta.thinking, delta.thought
-        - Some providers: delta.model_extra['reasoning_content']
-        - Some providers: delta.model_extra['reasoning']
-        - Some providers: delta.model_extra['thinking']
+        - Some providers: delta.model_extra['reasoning_content' | 'reasoning' | 'thinking' | 'thought']
         """
-        # Check known attribute names directly on the delta
-        for attr in ('reasoning_content', 'thinking', 'thought'):
-            val = getattr(delta, attr, None)
-            if isinstance(val, str) and val:
-                return val
-        # Check model_extra (Pydantic v2 extra fields passthrough)
-        model_extra = getattr(delta, 'model_extra', None)
-        if isinstance(model_extra, dict):
-            for key in ('reasoning_content', 'reasoning', 'thinking', 'thought'):
-                val = model_extra.get(key)
-                if isinstance(val, str) and val:
-                    return val
-        return None
+        return _extract_reasoning_fields(delta)
 
     def clear_history(self) -> None:
         """Clear the conversation history (but keep custom context)."""
@@ -447,6 +422,36 @@ class AgentHarness:
             {"role": "system", "content": self._build_system_content()},
             {"role": "user", "content": prompt},
         ]
+
+    def _track_and_emit_tokens(
+        self,
+        turn_input: int,
+        turn_output: int,
+        turn_cached: int,
+        callback: Optional[Callable[..., Any]] = None,
+    ) -> None:
+        """Accumulate per-turn token usage and emit a live ``tokens`` event.
+
+        Shared by the streaming and non-streaming paths so the cumulative
+        counters and the event payload stay in sync (DRY).
+        """
+        self.input_tokens += turn_input
+        self.output_tokens += turn_output
+        self.cached_tokens += turn_cached
+        if callback:
+            callback({
+                "type": "tokens",
+                "input_tokens": self.input_tokens,
+                "output_tokens": self.output_tokens,
+                "total_tokens": self.input_tokens + self.output_tokens,
+                "cached_tokens": self.cached_tokens,
+                "turn_input": turn_input,
+                "turn_output": turn_output,
+                "turn_cached": turn_cached,
+                "context_window": self.context_window,
+                "model": self.model,
+                "reasoning_effort": self.reasoning_effort,
+            })
 
     def _parse_response(self, response: Any) -> Tuple[Optional[str], Optional[str], List[Dict[str, Any]]]:
         """Parse an OpenAI chat completion response.
@@ -492,30 +497,7 @@ class AgentHarness:
 
         Different providers return reasoning in different fields:
         - OpenAI o-series: message.reasoning_content
-        - Some providers: message.thinking
-        - Some providers: message.thought
-        - Some providers: message.model_extra['reasoning_content']
-        - Some providers: message.model_extra['reasoning']
-        - Some providers: message.model_extra['thinking']
+        - Some providers: message.thinking, message.thought
+        - Some providers: message.model_extra['reasoning_content' | 'reasoning' | 'thinking' | 'thought']
         """
-        reasoning = getattr(message, 'reasoning_content', None)
-        if isinstance(reasoning, str):
-            return reasoning
-        reasoning = getattr(message, 'thinking', None)
-        if isinstance(reasoning, str):
-            return reasoning
-        reasoning = getattr(message, 'thought', None)
-        if isinstance(reasoning, str):
-            return reasoning
-        model_extra = getattr(message, 'model_extra', None)
-        if isinstance(model_extra, dict):
-            reasoning = model_extra.get('reasoning_content')
-            if isinstance(reasoning, str):
-                return reasoning
-            reasoning = model_extra.get('reasoning')
-            if isinstance(reasoning, str):
-                return reasoning
-            reasoning = model_extra.get('thinking')
-            if isinstance(reasoning, str):
-                return reasoning
-        return None
+        return _extract_reasoning_fields(message)

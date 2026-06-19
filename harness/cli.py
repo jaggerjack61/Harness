@@ -9,6 +9,7 @@ import json
 import os
 import sys
 import textwrap
+import threading
 import time
 from typing import Any, Dict, List, Optional
 
@@ -29,13 +30,78 @@ from harness.markdown import render_markdown, _make_console
 
 from harness.agent import AgentHarness
 
+
+class _ResponseBuffer:
+    """O(1)-append buffer for streamed response text.
+
+    Tracks the last newline incrementally so the newline-terminated ``complete``
+    prefix (re-rendered as Markdown only on line boundaries) and the trailing
+    ``partial`` line can be retrieved without re-scanning or re-concatenating
+    the full accumulated text on every delta. Fully-complete front chunks are
+    folded into ``_complete`` and dropped, so ``partial`` joins only the chunks
+    belonging to the current (incomplete) line.
+    """
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self._chunks: List[str] = []
+        self._complete: str = ""
+
+    def append(self, content: str) -> None:
+        if not content:
+            return
+        self._chunks.append(content)
+        if "\n" in content:
+            self._compact()
+
+    def _compact(self) -> None:
+        """Fold text up to and including the last newline into ``_complete``."""
+        if not self._chunks:
+            return
+        last = self._chunks[-1]
+        nl = last.rfind("\n")
+        if nl < 0:
+            return
+        # Absolute char position right after the last newline.
+        pre_last = len(self._complete) + sum(len(c) for c in self._chunks[:-1])
+        boundary = pre_last + nl + 1
+        # Consume whole chunks that end at or before the boundary.
+        while self._chunks and len(self._complete) + len(self._chunks[0]) <= boundary:
+            self._complete += self._chunks.pop(0)
+        # Slice the chunk straddling the boundary, if any.
+        if self._chunks and len(self._complete) < boundary:
+            take = boundary - len(self._complete)
+            c = self._chunks[0]
+            self._complete += c[:take]
+            self._chunks[0] = c[take:]
+
+    def set_complete(self, text: str) -> None:
+        """Replace the buffer with finalized text (used by text_end)."""
+        self._chunks = []
+        self._complete = text
+
+    @property
+    def complete(self) -> str:
+        return self._complete
+
+    @property
+    def partial(self) -> str:
+        return "".join(self._chunks)
+
+    @property
+    def text(self) -> str:
+        return self._complete + "".join(self._chunks)
+
+
 # Module-level Rich console and live display for the token status bar
 _console: Optional[Console] = None
 _live: Optional[Live] = None
 _no_markdown: bool = False  # set by main() from --no-markdown flag
 _streamed_any: bool = False  # whether we have printed any text_delta this response
-_response_text: str = ""  # accumulated response text for the live display
-_response_complete: str = ""  # newline-terminated prefix of _response_text (Markdown-parsed)
+_response_buffer: _ResponseBuffer = _ResponseBuffer()  # accumulated streamed response text
+_response_complete: str = ""  # newline-terminated prefix of the response (Markdown-parsed)
 _response_md: Optional[Any] = None  # cached Markdown renderable for the complete portion
 _response_renderable: Optional[Any] = None  # current response renderable in Live
 _token_text: Optional[Any] = None  # current token status bar renderable
@@ -58,12 +124,12 @@ _thinking_renderable: Optional[Text] = None  # partial-line mirror shown in the 
 
 def _reset_stream_state() -> None:
     """Reset per-response streaming state before a new agent turn."""
-    global _streamed_any, _response_text, _response_complete, _response_md
+    global _streamed_any, _response_complete, _response_md
     global _response_renderable, _token_text
     global _thinking_line_buf, _thinking_first_line, _thinking_renderable
     global _agent_active, _last_token_event
     _streamed_any = False
-    _response_text = ""
+    _response_buffer.reset()
     _response_complete = ""
     _response_md = None
     _response_renderable = None
@@ -103,8 +169,9 @@ def _build_response_renderable() -> Optional[Any]:
     per-character re-parsing.
     """
     if _no_markdown:
-        return Text(f"🤖 {_response_text}") if _response_text else None
-    partial = _response_text[len(_response_complete):]
+        full = _response_buffer.text
+        return Text(f"🤖 {full}") if full else None
+    partial = _response_buffer.partial
     if not _response_complete:
         # No complete lines yet — show the partial as plain text with the prefix.
         return Text(f"🤖 {partial}") if partial else None
@@ -298,7 +365,7 @@ def _print_wrapped(
 
 def _on_event(event: dict) -> None:
     """Handle a progress event from the agent — print live status."""
-    global _streamed_any, _response_text, _response_complete, _response_md
+    global _streamed_any, _response_complete, _response_md
     global _response_renderable, _thinking_line_buf, _thinking_first_line, _thinking_renderable
     etype = event["type"]
 
@@ -419,10 +486,9 @@ def _on_event(event: dict) -> None:
         else:
             _streamed_any = True
             if _live is not None:
-                _response_text += content
+                _response_buffer.append(content)
                 # Fold any newly-completed lines into the Markdown cache.
-                idx = _response_text.rfind("\n")
-                new_complete = _response_text[:idx + 1] if idx >= 0 else ""
+                new_complete = _response_buffer.complete
                 if new_complete != _response_complete:
                     _response_complete = new_complete
                     _rebuild_response_md()
@@ -436,7 +502,7 @@ def _on_event(event: dict) -> None:
         # Markdown cache too, so the final render is fully styled.
         content = event.get("content", "")
         if _live is not None:
-            _response_text = content
+            _response_buffer.set_complete(content)
             _response_complete = content  # entire response is now "complete"
             if _no_markdown:
                 _response_renderable = Text(f"🤖 {content}\n")
@@ -548,14 +614,23 @@ def _build_token_text(event: dict, max_width: Optional[int] = None,
         minimal_required = required[:1] + required[2:]
         candidates.append((minimal_required + [delta], " "))
 
-    for parts, spacing in candidates:
-        text = _assemble(parts, spacing)
-        cell_len = getattr(text, "cell_length", text.cell_len)
-        if max_width is None or cell_len <= max_width:
-            return text
+    def _width_of(parts: List[tuple], spacing: str) -> int:
+        """Cell width of an assembled bar, computed without building a Text."""
+        total = 0
+        for i, (part, _style) in enumerate(parts):
+            if i:
+                total += len(spacing)
+            total += cell_len(part)
+        return total
 
-    # Fallback to the smallest candidate (should never reach here).
-    return _assemble(candidates[-1][0], candidates[-1][1])
+    # Pick the most detailed candidate that fits via cheap arithmetic, then
+    # build a single Text instead of constructing one per candidate.
+    chosen = candidates[-1]
+    for parts, spacing in candidates:
+        if max_width is None or _width_of(parts, spacing) <= max_width:
+            chosen = (parts, spacing)
+            break
+    return _assemble(chosen[0], chosen[1])
 
 
 class _AnimatedTokenBar:
@@ -620,12 +695,14 @@ def _clear_status_bar() -> None:
         _live = None
 
 
-def _fetch_models(base_url: str, api_key: Optional[str] = None) -> List[str]:
+def _fetch_models(base_url: str, api_key: Optional[str] = None,
+                   silent: bool = False) -> List[str]:
     """Fetch available models from the configured API's /models endpoint.
 
     The list is queried against the user's configured --base-url (an
     OpenAI-compatible endpoint), optionally authenticating with the provided
-    API key.
+    API key. When ``silent`` is True, fetch failures are not printed (used by
+    the background fetcher so its error output cannot race with the REPL).
     """
     url = f"{base_url.rstrip('/')}/models"
     headers: Dict[str, str] = {}
@@ -638,8 +715,46 @@ def _fetch_models(base_url: str, api_key: Optional[str] = None) -> List[str]:
         models = [m["id"] for m in data.get("data", [])]
         return sorted(models)
     except Exception as e:
-        print(f"❌ Failed to fetch models: {e}")
+        if not silent:
+            print(f"❌ Failed to fetch models: {e}")
         return []
+
+
+class _ModelFetcher:
+    """Fetches the model list in a background thread so startup isn't blocked.
+
+    The first ``get()`` call blocks until the background fetch finishes; later
+    calls return the cached result immediately. ``refresh()`` re-fetches
+    synchronously (used by ``/models`` when the initial fetch came back empty).
+    """
+
+    def __init__(self, base_url: str, api_key: Optional[str]) -> None:
+        self._base_url = base_url
+        self._api_key = api_key
+        self._models: List[str] = []
+        self._done = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        try:
+            self._models = _fetch_models(self._base_url, self._api_key, silent=True)
+        finally:
+            self._done.set()
+
+    @property
+    def ready(self) -> bool:
+        return self._done.is_set()
+
+    def get(self, timeout: Optional[float] = None) -> List[str]:
+        """Return the model list, waiting for the background fetch if needed."""
+        self._done.wait(timeout)
+        return self._models
+
+    def refresh(self) -> None:
+        """Re-fetch synchronously and cache the result."""
+        self._models = _fetch_models(self._base_url, self._api_key)
+        self._done.set()
 
 
 def _read_multiline_context() -> Optional[str]:
@@ -897,12 +1012,9 @@ def main(argv: Optional[list] = None) -> None:
     print(_build_welcome_box(args.model, args.reasoning_effort, args.context_window, args.dir, use_stream))
     print()
 
-    # Pre-fetch models on launch so /models is instant
-    models = _fetch_models(args.base_url, args.api_key)
-    if models:
-        print(f"📦 {len(models)} models loaded. Use /models to switch.\n")
-    else:
-        print("⚠️ Could not pre-fetch models — /models will retry on demand.\n")
+    # Pre-fetch models in the background so the REPL is ready immediately.
+    fetcher = _ModelFetcher(args.base_url, args.api_key)
+    print("📦 Loading models in background… Use /models to browse.\n")
 
     while True:
         try:
@@ -927,10 +1039,14 @@ def main(argv: Optional[list] = None) -> None:
             # Redisplay the welcome banner
             print(_build_welcome_box(current_model, agent.reasoning_effort, args.context_window, args.dir, use_stream))
             print()
-            if models:
-                print(f"📦 {len(models)} models loaded. Use /models to switch.\n")
+            if fetcher.ready:
+                models = fetcher.get()
+                if models:
+                    print(f"📦 {len(models)} models loaded. Use /models to switch.\n")
+                else:
+                    print("⚠️ Could not pre-fetch models — /models will retry on demand.\n")
             else:
-                print("⚠️ Could not pre-fetch models — /models will retry on demand.\n")
+                print("📦 Loading models in background… Use /models to browse.\n")
             print("🔄 History cleared.\n")
             continue
 
@@ -941,9 +1057,12 @@ def main(argv: Optional[list] = None) -> None:
             continue
 
         if user_input.lower() == "/models":
+            # Wait for the background fetch, then retry synchronously if empty.
+            models = fetcher.get()
             if not models:
                 print("\nFetching models...")
-                models = _fetch_models(args.base_url, args.api_key)
+                fetcher.refresh()
+                models = fetcher.get()
             selected = _prompt_model_selection(models, current_model)
             if selected and selected != current_model:
                 current_model = selected

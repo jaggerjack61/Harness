@@ -18,14 +18,20 @@ def _enforce_line_limit(result: str, tool_name: str) -> str:
     When a tool call response exceeds 1,000 lines, the output is discarded
     and a prompt is returned asking the agent to retry with line-limiting
     commands (e.g. ``head`` or ``Select-Object -First``).
+
+    Line counting uses ``str.count`` instead of ``splitlines`` to avoid
+    materializing an N-element list for the common under-limit path.
     """
-    lines = result.splitlines()
-    if len(lines) <= MAX_OUTPUT_LINES:
+    if not result:
+        return result
+
+    line_count = result.count("\n") + (0 if result.endswith("\n") else 1)
+    if line_count <= MAX_OUTPUT_LINES:
         return result
 
     return (
         f"Error: The {tool_name!r} tool response exceeded the {MAX_OUTPUT_LINES:,}-line limit "
-        f"({len(lines):,} lines returned). The output has been discarded. "
+        f"({line_count:,} lines returned). The output has been discarded. "
         f"Please try again using line-limiting commands such as "
         f"`head -n <N>`, `tail -n <N>`, or `Select-Object -First <N>`."
     )
@@ -163,23 +169,19 @@ def read_file(path: str, offset: Optional[int] = None, limit: Optional[int] = No
     if not p.exists():
         return f"Error: File not found: {path}"
 
-    try:
-        text = p.read_text(encoding="utf-8", errors="replace")
-    except Exception as e:
-        return f"Error reading file: {e}"
-
     if offset is not None and offset < 1:
         return f"Error: offset must be >= 1 (got {offset})"
 
-    if offset is not None or limit is not None:
-        start = (offset - 1) if offset else 0
-        end = (start + limit) if limit else None
-        # Avoid loading very large files into memory when only a slice is needed.
-        with p.open("r", encoding="utf-8", errors="replace") as f:
-            lines = list(itertools.islice(f, start, end))
-        text = "".join(lines)
-
-    return text
+    try:
+        if offset is not None or limit is not None:
+            start = (offset - 1) if offset else 0
+            end = (start + limit) if limit else None
+            # Stream only the requested slice instead of loading the whole file.
+            with p.open("r", encoding="utf-8", errors="replace") as f:
+                return "".join(itertools.islice(f, start, end))
+        return p.read_text(encoding="utf-8", errors="replace")
+    except Exception as e:
+        return f"Error reading file: {e}"
 
 
 def write_file(path: str, content: str, cwd: Optional[str] = None) -> str:

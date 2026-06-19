@@ -954,3 +954,94 @@ class TestTokenEvent:
         assert result == "Final answer."
         assert events[0]["type"] == "tokens"
         assert events[1]["type"] == "text"
+
+
+class TestTrackAndEmitTokens:
+    """The shared token-tracking helper accumulates and emits one event."""
+
+    def test_accumulates_and_emits_event(self):
+        agent = AgentHarness(model="deepseek-v4-pro", api_key="sk-test",
+                              reasoning_effort="high", context_window=256000)
+        agent.input_tokens = 100
+        agent.output_tokens = 20
+        agent.cached_tokens = 5
+        events = []
+        agent._track_and_emit_tokens(50, 10, 3, callback=events.append)
+        assert agent.input_tokens == 150
+        assert agent.output_tokens == 30
+        assert agent.cached_tokens == 8
+        assert len(events) == 1
+        e = events[0]
+        assert e["type"] == "tokens"
+        assert e["input_tokens"] == 150
+        assert e["output_tokens"] == 30
+        assert e["total_tokens"] == 180
+        assert e["cached_tokens"] == 8
+        assert e["turn_input"] == 50
+        assert e["turn_output"] == 10
+        assert e["turn_cached"] == 3
+        assert e["model"] == "deepseek-v4-pro"
+        assert e["reasoning_effort"] == "high"
+        assert e["context_window"] == 256000
+
+    def test_no_callback_still_accumulates(self):
+        agent = AgentHarness(model="m", api_key="sk-test")
+        agent._track_and_emit_tokens(40, 5, 0, callback=None)
+        assert agent.input_tokens == 40
+        assert agent.output_tokens == 5
+        assert agent.cached_tokens == 0
+
+
+class TestExtractReasoningFields:
+    """Shared helper extracts reasoning from deltas and messages alike."""
+
+    def _obj(self, **kw):
+        m = MagicMock()
+        m.reasoning_content = kw.get("reasoning_content", None)
+        m.thinking = kw.get("thinking", None)
+        m.thought = kw.get("thought", None)
+        m.model_extra = kw.get("model_extra", None)
+        return m
+
+    def test_extracts_direct_reasoning_content(self):
+        from harness.agent import _extract_reasoning_fields
+        assert _extract_reasoning_fields(self._obj(reasoning_content="hello")) == "hello"
+
+    def test_extracts_thinking_attr(self):
+        from harness.agent import _extract_reasoning_fields
+        assert _extract_reasoning_fields(self._obj(thinking="step")) == "step"
+
+    def test_extracts_thought_attr(self):
+        from harness.agent import _extract_reasoning_fields
+        assert _extract_reasoning_fields(self._obj(thought="idea")) == "idea"
+
+    def test_extracts_from_model_extra_reasoning(self):
+        from harness.agent import _extract_reasoning_fields
+        assert _extract_reasoning_fields(self._obj(model_extra={"reasoning": "deep"})) == "deep"
+
+    def test_extracts_from_model_extra_thinking(self):
+        from harness.agent import _extract_reasoning_fields
+        assert _extract_reasoning_fields(self._obj(model_extra={"thinking": "x"})) == "x"
+
+    def test_extracts_from_model_extra_thought(self):
+        from harness.agent import _extract_reasoning_fields
+        assert _extract_reasoning_fields(self._obj(model_extra={"thought": "y"})) == "y"
+
+    def test_returns_none_when_absent(self):
+        from harness.agent import _extract_reasoning_fields
+        assert _extract_reasoning_fields(self._obj()) is None
+
+    def test_precedence_reasoning_content_over_thinking(self):
+        from harness.agent import _extract_reasoning_fields
+        obj = self._obj(reasoning_content="primary", thinking="secondary")
+        assert _extract_reasoning_fields(obj) == "primary"
+
+    def test_ignores_non_string_values(self):
+        from harness.agent import _extract_reasoning_fields
+        obj = self._obj(thinking={"not": "a string"})
+        assert _extract_reasoning_fields(obj) is None
+
+    def test_ignores_empty_string(self):
+        from harness.agent import _extract_reasoning_fields
+        obj = self._obj(reasoning_content="")
+        assert _extract_reasoning_fields(obj) is None

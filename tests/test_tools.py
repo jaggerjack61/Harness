@@ -115,6 +115,30 @@ class TestReadFile:
         result = read_file("file.txt", cwd=str(sub), offset=2)
         assert result == "b\nc"
 
+    def test_offset_limit_skips_full_read(self, tmp_path: Path, monkeypatch):
+        """Reading with offset/limit must not load the entire file into memory."""
+        f = tmp_path / "big.txt"
+        f.write_text("line1\nline2\nline3\nline4\nline5")
+
+        def boom(self, *a, **k):
+            raise AssertionError("read_text called when offset/limit given")
+
+        monkeypatch.setattr(Path, "read_text", boom)
+        result = read_file(str(f), offset=2, limit=2)
+        assert result == "line2\nline3\n"
+
+    def test_limit_only_skips_full_read(self, tmp_path: Path, monkeypatch):
+        """Reading with only limit must not load the entire file into memory."""
+        f = tmp_path / "big.txt"
+        f.write_text("line1\nline2\nline3")
+
+        def boom(self, *a, **k):
+            raise AssertionError("read_text called when limit given")
+
+        monkeypatch.setattr(Path, "read_text", boom)
+        result = read_file(str(f), limit=2)
+        assert result == "line1\nline2\n"
+
 
 class TestWriteFile:
     def test_creates_new_file(self, tmp_path: Path):
@@ -263,6 +287,35 @@ class TestToolRegistry:
 
 class TestToolOutputLineLimit:
     """Tool call responses exceeding 1,000 lines must be discarded and the agent notified."""
+
+    def test_under_limit_does_not_splitlines(self):
+        """Under-limit output must not materialize a full line list (O(n) alloc)."""
+        from harness.tools import _enforce_line_limit
+
+        class CountingStr(str):
+            calls = 0
+
+            def splitlines(self, *a, **k):
+                CountingStr.calls += 1
+                return super().splitlines(*a, **k)
+
+        CountingStr.calls = 0
+        result = _enforce_line_limit(CountingStr("line1\nline2\nline3"), "bash")
+        assert result == "line1\nline2\nline3"
+        assert CountingStr.calls == 0
+
+    def test_empty_string_line_count(self):
+        """Empty output must report zero lines (no spurious +1)."""
+        from harness.tools import _enforce_line_limit
+
+        assert _enforce_line_limit("", "bash") == ""
+
+    def test_no_trailing_newline_line_count(self):
+        """Output without a trailing newline must count the final line."""
+        from harness.tools import _enforce_line_limit
+
+        result = _enforce_line_limit("a\nb\nc", "bash")
+        assert result == "a\nb\nc"  # 3 lines, under limit
 
     def test_bash_output_under_limit_is_preserved(self, tmp_path: Path):
         registry = ToolRegistry(working_dir=str(tmp_path))
