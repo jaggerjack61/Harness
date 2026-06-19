@@ -1,5 +1,5 @@
 # harness.ps1.example — Template for the harness launcher script
-# Copy this to harness.ps1 and fill in your API credentials.
+# Copy this to harness.ps1 and fill in your credentials in .env.
 # harness.ps1 is gitignored — never commit your API key.
 #
 # Add this script's directory to your PATH to use 'harness' from any folder.
@@ -12,15 +12,32 @@
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $originalDir = $PWD.Path
 
+# Load credentials and defaults from .env next to this script
+$envFile = Join-Path $scriptDir ".env"
+if (Test-Path $envFile) {
+    Get-Content $envFile | ForEach-Object {
+        # Skip comments and blank lines
+        if ($_ -match '^\s*#' -or $_ -match '^\s*$') { return }
+        # Split on first '=' only
+        $name, $value = $_ -split '=', 2
+        $name = $name.Trim()
+        $value = $value.Trim()
+        # Strip optional surrounding quotes
+        if ($value.Length -ge 2 -and (($value.StartsWith('"') -and $value.EndsWith('"')) -or ($value.StartsWith("'") -and $value.EndsWith("'")))) {
+            $value = $value.Substring(1, $value.Length - 2)
+        }
+        [Environment]::SetEnvironmentVariable($name, $value, "Process")
+    }
+} else {
+    Write-Warning "No .env file found at $envFile. Create it from .env.example."
+}
+
 # Run from the script's directory so python -m harness resolves correctly
 Push-Location $scriptDir
 try {
     python -m harness `
-        --context 1000000 `
         --reasoning-effort high `
         --model "YOUR_MODEL" `
-        --base-url "YOUR_BASE_URL" `
-        --api-key "YOUR_API_KEY" `
         --dir $originalDir `
         @args
 } finally {

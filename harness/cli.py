@@ -155,8 +155,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--max-turns",
         type=int,
-        default=25,
-        help="Maximum tool-calling turns (default: 25)",
+        default=int(os.environ.get("HARNESS_MAX_TURNS", "1000")),
+        help="Maximum tool-calling turns (default: 1000 or $HARNESS_MAX_TURNS)",
     )
     p.add_argument(
         "--system-prompt",
@@ -172,8 +172,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--context-window",
         type=int,
-        default=256000,
-        help="Model context window size in tokens (default: 256000 for 256K).",
+        default=int(os.environ.get("HARNESS_CONTEXT_WINDOW", "1000000")),
+        help="Model context window size in tokens (default: 1000000 for 1M or $HARNESS_CONTEXT_WINDOW).",
     )
     p.add_argument(
         "--no-markdown",

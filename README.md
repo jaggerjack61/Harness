@@ -14,6 +14,7 @@ A lightweight AI agent framework that connects to any OpenAI-compatible chat mod
 - **Conversation history** — the agent remembers context across turns; `/clear` to reset.
 - **Real-time token tracking** — live status bar showing cumulative input/output/cache token counts and context window usage.
 - **Cross-platform** — uses PowerShell on Windows, bash on Unix/macOS.
+- **Output safety** — tool outputs above 1,000 lines are dropped and the agent is asked to retry with line-limiting commands (`head`, `Select-Object -First`, etc.).
 
 ## Requirements
 
@@ -38,16 +39,19 @@ pip install -e ".[dev]"
 
 ### PowerShell launcher (Windows)
 
-Copy the example launcher and fill in your credentials:
+Copy the example files and fill in your credentials:
 
 ```bash
 cp harness.ps1.example harness.ps1
-# Edit harness.ps1 — replace YOUR_MODEL, YOUR_BASE_URL, YOUR_API_KEY
+cp .env.example .env
+# Edit .env — replace YOUR_API_KEY and HARNESS_BASE_URL with your credentials
 ```
 
 Then add the harness directory to your `PATH` so you can run `harness` from anywhere.
 
-> **⚠️ `harness.ps1` is gitignored** — never commit your API key.
+> **⚠️ `.env` and `harness.ps1` are gitignored** — never commit your API key.
+>
+> The launcher loads credentials from `.env` at runtime, so your key never needs to sit inside `harness.ps1` itself.
 
 ## Quick Start
 
@@ -73,18 +77,17 @@ python -m harness
 Then just type a prompt and watch the agent work!
 
 ```
-╔══════════════════════════════════════════════════════╗
-║  🤖 Nasa Level Genius Agent                         ║
-║  Model:           deepseek-v4-pro                   ║
-║  Reasoning:       high                              ║
-║  Context window:  256,000 tokens                    ║
-║  Streaming:       on                                ║
-║  CWD:             my-project                        ║
-║  ────────────────────────────────────────           ║
-║  Commands:  /exit  /clear  /models  /reasoning      ║
-║             /stream  /context  /context show         ║
-║             /context clear                          ║
-╚══════════════════════════════════════════════════════╝
+╔════════════════════════════════════════════════════════════════════════╗
+║  🤖 Nasa Level Genius Agent                                           ║
+║  Model:           deepseek-v4-pro                                     ║
+║  Reasoning:       high                                                ║
+║  Context window:  1,000,000 tokens                                    ║
+║  Streaming:       on                                                  ║
+║  CWD:             my-project                                          ║
+║  ────────────────────────────────────────                             ║
+║  Commands:  /exit  /clear  /models  /reasoning                        ║
+║             /stream  /context  /context show  /context clear          ║
+╚════════════════════════════════════════════════════════════════════════╝
 
 📦 42 models loaded. Use /models to switch.
 
@@ -103,7 +106,7 @@ Then just type a prompt and watch the agent work!
 
 🤖 The project version is **0.1.0**.
 
-📊 deepseek-v4-pro  In:1,234  Out:56  Tot:1,290  Ctx:0.5%  🧠 high  [+234/56]
+📊 deepseek-v4-pro  In:5,000  Out:200  Tot:5,200  Ctx:0.5%  🧠 high  [+5,000/200]
 ```
 
 ## CLI Options
@@ -114,10 +117,10 @@ Then just type a prompt and watch the agent work!
 | `--api-key` | `-k` | `$OPENAI_API_KEY` | API key |
 | `--base-url` | `-u` | `https://api.openai.com/v1` | API base URL |
 | `--dir` | `-d` | Current directory | Working directory for shell commands |
-| `--max-turns` | | `25` | Maximum tool-calling turns per prompt |
+| `--max-turns` | | `1000` (or `$HARNESS_MAX_TURNS`) | Maximum tool-calling turns per prompt |
 | `--system-prompt` | | Built-in default | Custom system prompt (or `$HARNESS_PROMPT`) |
 | `--reasoning-effort` | | `high` | `low`, `medium`, `high`, `xhigh`, or `max` |
-| `--context-window` | | `256000` | Model context window size in tokens |
+| `--context-window` | | `1000000` (or `$HARNESS_CONTEXT_WINDOW`) | Model context window size in tokens |
 | `--stream` | | `true` (default) | Enable streaming output |
 | `--no-stream` | | `false` | Disable streaming (wait for complete response) |
 | `--no-markdown` | | `false` | Disable Markdown rendering (print plain text) |
@@ -143,8 +146,12 @@ The agent has access to four tools:
 |---|---|
 | **read** | Read file contents with optional `offset` and `limit` for large files |
 | **write** | Create or overwrite a file (auto-creates parent directories) |
-| **edit** | Apply precise find-and-replace edits to a file |
+| **edit** | Apply precise find-and-replace edits to a file — multiple edits can be applied in a single call |
 | **bash** | Execute a shell command (PowerShell on Windows, bash elsewhere) with a 60-second timeout |
+
+### Tool output limits
+
+Any tool that returns more than **1,000 lines** of output is **dropped** before reaching the model. The agent is told the output was discarded and asked to retry using line-limiting commands such as `head -n <N>`, `tail -n <N>`, or `Select-Object -First <N>`. This keeps the model context window from being filled by a single verbose command.
 
 ## Environment Variables
 
@@ -154,6 +161,8 @@ The agent has access to four tools:
 | `HARNESS_MODEL` | Default model name |
 | `HARNESS_BASE_URL` | Default API base URL |
 | `HARNESS_PROMPT` | Default system prompt |
+| `HARNESS_MAX_TURNS` | Default `--max-turns` value |
+| `HARNESS_CONTEXT_WINDOW` | Default `--context-window` value |
 
 ## Markdown Rendering
 
@@ -236,8 +245,9 @@ print(f"Input: {agent.input_tokens}, Output: {agent.output_tokens}")
 
 | Event | Fields | Description |
 |---|---|---|
-| `thinking` | `content` | Complete model reasoning / chain-of-thought (displayed before tool calls) |
-| `thinking_delta` | `content` | Incremental reasoning chunk (streaming only; not emitted in normal flow) |
+| `thinking` | `content` | Complete model reasoning / chain-of-thought (non-streaming) |
+| `thinking_delta` | `content` | Incremental reasoning chunk (streaming only) |
+| `thinking_end` | *(none)* | End of a streaming reasoning block — emitted when the model finishes thinking and starts producing tool calls or text |
 | `text` | `content` | Final model text response (non-streaming) |
 | `text_delta` | `content` | Incremental text token (streaming only; rendered via text_end) |
 | `text_end` | `content` | Complete response text (streaming only; triggers markdown rendering) |

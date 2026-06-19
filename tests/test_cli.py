@@ -36,15 +36,51 @@ class TestArgumentParser:
         assert args.dir == "/tmp"
         assert args.api_key == "sk-abc"
 
+    @patch.dict("os.environ", {}, clear=True)
     def test_max_turns_default(self):
         parser = _build_parser()
         args = parser.parse_args([])
-        assert args.max_turns == 25
+        assert args.max_turns == 1000
 
     def test_max_turns_custom(self):
         parser = _build_parser()
         args = parser.parse_args(["--max-turns", "10"])
         assert args.max_turns == 10
+
+    @patch.dict("os.environ", {"HARNESS_MAX_TURNS": "500"})
+    def test_max_turns_env_var_default(self):
+        parser = _build_parser()
+        args = parser.parse_args([])
+        assert args.max_turns == 500
+
+    @patch.dict("os.environ", {"HARNESS_MAX_TURNS": "500"})
+    def test_max_turns_cli_overrides_env(self):
+        parser = _build_parser()
+        args = parser.parse_args(["--max-turns", "10"])
+        assert args.max_turns == 10
+
+    @patch.dict("os.environ", {}, clear=True)
+    def test_context_window_default(self):
+        parser = _build_parser()
+        args = parser.parse_args([])
+        assert args.context_window == 1000000
+
+    def test_context_window_custom(self):
+        parser = _build_parser()
+        args = parser.parse_args(["--context-window", "256000"])
+        assert args.context_window == 256000
+
+    @patch.dict("os.environ", {"HARNESS_CONTEXT_WINDOW": "500000"})
+    def test_context_window_env_var_default(self):
+        parser = _build_parser()
+        args = parser.parse_args([])
+        assert args.context_window == 500000
+
+    @patch.dict("os.environ", {"HARNESS_CONTEXT_WINDOW": "500000"})
+    def test_context_window_cli_overrides_env(self):
+        parser = _build_parser()
+        args = parser.parse_args(["--context-window", "256000"])
+        assert args.context_window == 256000
 
     def test_reasoning_effort_default_is_high(self):
         parser = _build_parser()

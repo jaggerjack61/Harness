@@ -22,6 +22,8 @@ htmlcov/
 .venv/
 venv/
 env/
+
+# Environment / secrets
 .env
 
 # IDE files

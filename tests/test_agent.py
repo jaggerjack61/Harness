@@ -46,6 +46,22 @@ class TestAgentHarnessInit:
         agent = AgentHarness(model="deepseek-v4-pro")
         assert agent.reasoning_effort is None
 
+    def test_max_turns_default_is_1000(self):
+        agent = AgentHarness(model="deepseek-v4-pro")
+        assert agent.max_turns == 1000
+
+    def test_context_window_default_is_1000000(self):
+        agent = AgentHarness(model="deepseek-v4-pro")
+        assert agent.context_window == 1000000
+
+    def test_max_turns_explicit_override(self):
+        agent = AgentHarness(model="deepseek-v4-pro", max_turns=5)
+        assert agent.max_turns == 5
+
+    def test_context_window_explicit_override(self):
+        agent = AgentHarness(model="deepseek-v4-pro", context_window=256000)
+        assert agent.context_window == 256000
+
 
 class TestCustomContext:
     def test_get_and_set_custom_context(self):

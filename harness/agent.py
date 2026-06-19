@@ -32,7 +32,7 @@ class AgentHarness:
         system_prompt: Custom system prompt.
         working_dir: Working directory for bash commands.
         max_turns: Maximum number of tool-calling turns before stopping.
-        context_window: Model context window size in tokens (default: 256000).
+        context_window: Model context window size in tokens (default: 1000000).
     """
 
     def __init__(
@@ -42,7 +42,7 @@ class AgentHarness:
         base_url: Optional[str] = None,
         system_prompt: Optional[str] = None,
         working_dir: Optional[str] = None,
-        max_turns: int = 10000,
+        max_turns: int = 1000,
         reasoning_effort: Optional[str] = None,
         context_window: int = 1000000,
     ):
