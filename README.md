@@ -12,9 +12,11 @@ A lightweight AI agent framework that connects to any OpenAI-compatible chat mod
 - **Configurable reasoning effort** — pass `--reasoning-effort low|medium|high|xhigh|max` for models that support it.
 - **Live progress events** — see tool calls, tool results, and thinking blocks in real time as the agent works.
 - **Conversation history** — the agent remembers context across turns; `/clear` to reset.
+- **Automatic context management** — history is trimmed/summarized when the conversation approaches the context window limit, so long sessions don't crash.
+- **Retry with exponential backoff** — transient API errors (429 rate limits, 5xx server errors, timeouts) are retried automatically up to 3 times.
 - **Real-time token tracking** — live status bar showing cumulative input/output/cache token counts and context window usage.
-- **Cross-platform** — uses PowerShell on Windows, bash on Unix/macOS.
-- **Output safety** — tool outputs above 1,000 lines are dropped and the agent is asked to retry with line-limiting commands (`head`, `Select-Object -First`, etc.).
+- **Cross-platform** — uses PowerShell (pwsh 7+ preferred) on Windows, bash on Unix/macOS. Shell can be overridden via `HARNESS_SHELL`.
+- **Output safety** — tool outputs above 1,000 lines (or 100 KB) are dropped and the agent is asked to retry with line-limiting commands (`head`, `Select-Object -First`, etc.).
 
 ## Requirements
 
@@ -124,6 +126,7 @@ Then just type a prompt and watch the agent work!
 | `--stream` | | `true` (default) | Enable streaming output |
 | `--no-stream` | | `false` | Disable streaming (wait for complete response) |
 | `--no-markdown` | | `false` | Disable Markdown rendering (print plain text) |
+| `--shell` | | Auto-detected | Override shell used by `bash` tool (env: `HARNESS_SHELL`) |
 
 ## Slash Commands
 
@@ -163,6 +166,7 @@ Any tool that returns more than **1,000 lines** of output is **dropped** before 
 | `HARNESS_PROMPT` | Default system prompt |
 | `HARNESS_MAX_TURNS` | Default `--max-turns` value |
 | `HARNESS_CONTEXT_WINDOW` | Default `--context-window` value |
+| `HARNESS_SHELL` | Override shell executable for `bash` tool (default: auto-detected `pwsh`/`powershell`/`bash`) |
 
 ## Markdown Rendering
 
@@ -253,7 +257,27 @@ print(f"Input: {agent.input_tokens}, Output: {agent.output_tokens}")
 | `text_end` | `content` | Complete response text (streaming only; triggers markdown rendering) |
 | `tool_call` | `name`, `arguments` | A tool is about to be executed |
 | `tool_result` | `name`, `result` | A tool has returned its result |
+| `turn_start` | *(none)* | A new agent turn is starting (after a tool-calling turn) |
+| `finish_reason` | `reason`, `content` | Non-standard finish reason (truncation, content filter, etc.) |
+| `history_trimmed` | `summarized` | Conversation history was trimmed/summarized to stay within context window |
 | `tokens` | `input_tokens`, `output_tokens`, `total_tokens`, `cached_tokens`, `turn_input`, `turn_output`, `turn_cached`, `context_window`, `model`, `reasoning_effort` | Live token usage after each API call |
+
+### Typed event dataclasses
+
+Events are also available as typed dataclasses via `harness.events`:
+
+```python
+from harness.events import TokensEvent, ToolCallEvent, from_dict
+
+# Parse a dict event into a typed dataclass
+event = from_dict({"type": "tool_call", "name": "read", "arguments": {"path": "main.py"}})
+assert isinstance(event, ToolCallEvent)
+
+# Events have a to_dict() method for serialization
+assert event.to_dict() == {"type": "tool_call", "name": "read", "arguments": {"path": "main.py"}}
+```
+
+All event types: `TokensEvent`, `ThinkingEvent`, `ThinkingDeltaEvent`, `ThinkingEndEvent`, `TextEvent`, `TextDeltaEvent`, `TextEndEvent`, `ToolCallEvent`, `ToolResultEvent`, `TurnStartEvent`, `FinishReasonEvent`, `HistoryTrimmedEvent`.
 
 ## Running Tests
 
@@ -268,14 +292,23 @@ harness/
 ├── harness/
 │   ├── __init__.py      # Package exports
 │   ├── __main__.py      # python -m harness entry point
-│   ├── agent.py         # AgentHarness — core agent loop with streaming + tool calling
+│   ├── agent.py         # AgentHarness — core agent loop with streaming, tool calling, retry, and context trimming
 │   ├── cli.py           # Interactive CLI with argument parsing and live event display
+│   ├── constants.py     # Centralized defaults, limits, and tuning knobs (DRY)
+│   ├── display.py       # LiveDisplay and ResponseBuffer for streaming output
+│   ├── events.py        # Typed event dataclasses and Callback protocol
 │   ├── markdown.py      # Markdown parser and renderer using Rich (custom theme)
+│   ├── prompts.py       # Unified interactive/numeric selection prompts
 │   └── tools.py         # Tool definitions and implementations
 ├── tests/
 │   ├── test_agent.py    # Tests for agent logic, message parsing, and callbacks
 │   ├── test_cli.py      # Tests for CLI argument parsing and event display
+│   ├── test_constants.py # Tests for constants module
+│   ├── test_display.py  # Tests for LiveDisplay and ResponseBuffer
+│   ├── test_events.py   # Tests for event dataclasses and from_dict
 │   ├── test_markdown.py # Tests for markdown rendering
+│   ├── test_prompts.py  # Tests for selection prompt helpers
+│   ├── test_resolve_path.py # Tests for path resolution
 │   ├── test_streaming.py # Tests for streaming response processing
 │   └── test_tools.py    # Tests for file and shell tool implementations
 ├── harness.ps1.example  # Template PowerShell launcher (copy to harness.ps1)
@@ -283,6 +316,71 @@ harness/
 ├── .gitignore
 └── README.md
 ```
+
+## Trust & Safety
+
+> **⚠️ Harness runs with full user privileges.** It is a research and development
+> tool, not a sandboxed environment. Read this section before using it on
+> important systems.
+
+### What Harness can do
+
+Harness gives an AI model the ability to:
+
+- **Read any file** the current user can read (no path confinement)
+- **Write, create, or overwrite any file** the current user can write
+- **Execute arbitrary shell commands** (PowerShell on Windows, bash on Unix)
+  with a 60-second timeout
+- **Make network calls** to the configured `--base-url`
+
+There is no allowlist, no sandbox, no confirmation prompt, and no
+command blocklist.
+
+### Implications
+
+- **Prompt injection is a real risk.** If the model reads an untrusted file
+  (e.g., a web page, a README, an email) that contains instructions, those
+  instructions may be followed — including running destructive shell commands.
+  Treat any content the model reads as if it were code.
+- **The model is not trusted.** It may produce output that, if executed
+  blindly, could delete files, exfiltrate data, or compromise your system.
+  Review tool calls and shell commands before they execute in production.
+- **There is no undo.** `write` and `edit` overwrite files immediately.
+  `bash` runs whatever the model decides. There is no dry-run mode.
+
+### Recommended practices
+
+- **Run in a dedicated working directory** (`--dir`) that contains only
+  the project you want the model to work on. Avoid pointing Harness at
+  your home directory, system folders, or shared drives.
+- **Use version control.** Commit your work before starting a session so
+  you can review and revert changes.
+- **Use a dedicated API key** with spending limits. Avoid using a key
+  with access to production systems or sensitive data.
+- **Review the welcome box** at session start to confirm the model,
+  reasoning effort, and working directory are correct.
+- **Interrupt with Ctrl-C** if the model starts doing something unexpected.
+  The agent loop will exit cleanly.
+- **Do not point Harness at secrets.** API keys, credentials, and
+  `.env` files in the working directory can be read by the model.
+
+### Threat model
+
+Harness assumes the user is a trusted developer and the model is
+untrusted-but-curious. It is suitable for:
+
+- Local development and prototyping
+- Automated refactoring in a controlled codebase
+- Research and experimentation
+
+It is **not** suitable for:
+
+- Running against production data or systems
+- Multi-tenant or shared environments
+- Scenarios where the model output is not human-supervised
+
+If you need stronger guarantees, consider running the agent in a
+container, VM, or restricted shell that limits what it can access.
 
 ## License
 

@@ -5,19 +5,15 @@ Usage:
 """
 
 import argparse
+import enum
 import json
 import os
-import sys
 import textwrap
 import threading
 import time
 from typing import Any, Dict, List, Optional
 
 import httpx
-from prompt_toolkit.application import Application
-from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.layout import Layout, Window
-from prompt_toolkit.layout.controls import FormattedTextControl
 from rich.cells import cell_len
 from rich.console import Console, Group
 from rich.errors import MarkupError
@@ -28,71 +24,69 @@ from rich.text import Text
 
 from harness.markdown import render_markdown, _make_console
 
+
+try:
+    BooleanOptionalAction = argparse.BooleanOptionalAction
+except AttributeError:  # pragma: no cover - Python < 3.9 fallback
+    class BooleanOptionalAction(argparse.Action):
+        """Backport of argparse.BooleanOptionalAction for Python 3.8."""
+
+        def __init__(
+            self,
+            option_strings,
+            dest,
+            default=None,
+            type=None,
+            choices=None,
+            required=False,
+            help=None,
+            metavar=None,
+        ):
+            expanded = []
+            for option_string in option_strings:
+                expanded.append(option_string)
+                if option_string.startswith("--"):
+                    expanded.append("--no-" + option_string[2:])
+            if help is not None and default is not None:
+                help += " (default: %(default)s)"
+            super().__init__(
+                option_strings=expanded,
+                dest=dest,
+                nargs=0,
+                default=default,
+                type=type,
+                choices=choices,
+                required=required,
+                help=help,
+                metavar=metavar,
+            )
+
+        def __call__(self, parser, namespace, values, option_string=None):
+            setattr(namespace, self.dest, not option_string.startswith("--no-"))
+
+        def format_usage(self):
+            return " | ".join(self.option_strings)
+
 from harness.agent import AgentHarness
+from harness.display import ResponseBuffer as _ResponseBuffer  # re-export for tests
+from harness import prompts
+from harness.constants import (
+    DEFAULT_MODEL,
+    DEFAULT_BASE_URL,
+    DEFAULT_REASONING_EFFORT,
+    DEFAULT_MAX_TURNS,
+    DEFAULT_CONTEXT_WINDOW,
+    REASONING_OPTIONS as _REASONING_OPTIONS_CONST,
+    NONSTANDARD_REASONING_EFFORTS,
+    FETCH_TIMEOUT,
+    DISPLAY_TRUNCATION_LIMIT,
+    LIVE_REFRESH_STREAMING,
+    LIVE_REFRESH_NON_STREAMING,
+    SPINNER_FRAMES as _SPINNER_FRAMES_CONST,
+)
 
 
-class _ResponseBuffer:
-    """O(1)-append buffer for streamed response text.
 
-    Tracks the last newline incrementally so the newline-terminated ``complete``
-    prefix (re-rendered as Markdown only on line boundaries) and the trailing
-    ``partial`` line can be retrieved without re-scanning or re-concatenating
-    the full accumulated text on every delta. Fully-complete front chunks are
-    folded into ``_complete`` and dropped, so ``partial`` joins only the chunks
-    belonging to the current (incomplete) line.
-    """
-
-    def __init__(self) -> None:
-        self.reset()
-
-    def reset(self) -> None:
-        self._chunks: List[str] = []
-        self._complete: str = ""
-
-    def append(self, content: str) -> None:
-        if not content:
-            return
-        self._chunks.append(content)
-        if "\n" in content:
-            self._compact()
-
-    def _compact(self) -> None:
-        """Fold text up to and including the last newline into ``_complete``."""
-        if not self._chunks:
-            return
-        last = self._chunks[-1]
-        nl = last.rfind("\n")
-        if nl < 0:
-            return
-        # Absolute char position right after the last newline.
-        pre_last = len(self._complete) + sum(len(c) for c in self._chunks[:-1])
-        boundary = pre_last + nl + 1
-        # Consume whole chunks that end at or before the boundary.
-        while self._chunks and len(self._complete) + len(self._chunks[0]) <= boundary:
-            self._complete += self._chunks.pop(0)
-        # Slice the chunk straddling the boundary, if any.
-        if self._chunks and len(self._complete) < boundary:
-            take = boundary - len(self._complete)
-            c = self._chunks[0]
-            self._complete += c[:take]
-            self._chunks[0] = c[take:]
-
-    def set_complete(self, text: str) -> None:
-        """Replace the buffer with finalized text (used by text_end)."""
-        self._chunks = []
-        self._complete = text
-
-    @property
-    def complete(self) -> str:
-        return self._complete
-
-    @property
-    def partial(self) -> str:
-        return "".join(self._chunks)
-
-    @property
-    def text(self) -> str:
-        return self._complete + "".join(self._chunks)
 
 
 # Module-level Rich console and live display for the token status bar
@@ -110,9 +104,7 @@ _agent_active: bool = False  # whether the agent is currently generating
 # Braille spinner frames shown as the leading indicator while the agent is
 # in action. Live's auto-refresh re-renders the bar, so picking the frame from
 # the current time yields a smooth animation.
-_SPINNER_FRAMES: List[str] = [
-    "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏",
-]
+_SPINNER_FRAMES: List[str] = _SPINNER_FRAMES_CONST
 # Thinking-streaming state. Reasoning is emitted as many small deltas that are
 # not line-aligned. Completed lines are flushed to scrolling output (above the
 # live region) so they persist; the trailing partial line is mirrored into the
@@ -197,13 +189,48 @@ def _update_live() -> None:
     _live.update(renderable, refresh=True)
 
 
+# Reasoning effort levels that are provider-specific (not in the OpenAI spec).
+# These are valid for DeepSeek but cause 400 errors on OpenAI o-series.
+_NONSTANDARD_REASONING_EFFORTS = NONSTANDARD_REASONING_EFFORTS
+
+
+def _check_reasoning_compatibility(base_url: str, reasoning_effort: Optional[str]) -> Optional[str]:
+    """Warn if reasoning_effort is non-standard for the configured provider.
+
+    ``xhigh`` and ``max`` are DeepSeek-specific; sending them to OpenAI
+    produces a 400. Returns a warning string, or None if no issue.
+    """
+    if reasoning_effort in _NONSTANDARD_REASONING_EFFORTS and "openai.com" in (base_url or ""):
+        return (
+            f"⚠️  Reasoning effort '{reasoning_effort}' is not supported by OpenAI "
+            f"and may cause errors. Use low/medium/high, or switch --base-url "
+            f"to a provider that supports it (e.g. DeepSeek)."
+        )
+    return None
+
+
+def _check_model_available(model: str, available_models: List[str]) -> Optional[str]:
+    """Warn if the configured model is not in the fetched /models list.
+
+    Returns a warning string, or None if the model is found or the list is
+    empty (fetch failed — can't validate).
+    """
+    if available_models and model not in available_models:
+        return (
+            f"⚠️  Model '{model}' was not found in the available models list "
+            f"({len(available_models)} models fetched). The first API call may "
+            f"fail with a model-not-found error. Use /models to select a valid model."
+        )
+    return None
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Interactive Nasa Level Genius Agent — chat with an AI that can read, write, edit, and run commands.",
     )
     p.add_argument(
         "--model", "-m",
-        default=os.environ.get("HARNESS_MODEL", "deepseek-v4-pro"),
+        default=os.environ.get("HARNESS_MODEL", DEFAULT_MODEL),
         help="Model name (default: deepseek-v4-pro or $HARNESS_MODEL)",
     )
     p.add_argument(
@@ -213,7 +240,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--base-url", "-u",
-        default=os.environ.get("HARNESS_BASE_URL", "https://api.openai.com/v1"),
+        default=os.environ.get("HARNESS_BASE_URL", DEFAULT_BASE_URL),
         help="Base URL for the API",
     )
     p.add_argument(
@@ -224,7 +251,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--max-turns",
         type=int,
-        default=int(os.environ.get("HARNESS_MAX_TURNS", "1000")),
+        default=int(os.environ.get("HARNESS_MAX_TURNS", str(DEFAULT_MAX_TURNS))),
         help="Maximum tool-calling turns (default: 1000 or $HARNESS_MAX_TURNS)",
     )
     p.add_argument(
@@ -234,14 +261,14 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--reasoning-effort",
-        default="high",
+        default=DEFAULT_REASONING_EFFORT,
         choices=["low", "medium", "high", "xhigh", "max"],
         help="Reasoning effort level (for models that support it, e.g. o-series). Default: high",
     )
     p.add_argument(
         "--context-window",
         type=int,
-        default=int(os.environ.get("HARNESS_CONTEXT_WINDOW", "1000000")),
+        default=int(os.environ.get("HARNESS_CONTEXT_WINDOW", str(DEFAULT_CONTEXT_WINDOW))),
         help="Model context window size in tokens (default: 1000000 for 1M or $HARNESS_CONTEXT_WINDOW).",
     )
     p.add_argument(
@@ -252,15 +279,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--stream",
-        action="store_true",
+        action=BooleanOptionalAction,
         default=True,
-        help="Enable streaming output (default: enabled).",
-    )
-    p.add_argument(
-        "--no-stream",
-        action="store_true",
-        default=False,
-        help="Disable streaming output (wait for complete response).",
+        help="Enable streaming output (default: enabled; use --no-stream to disable).",
     )
     return p
 
@@ -376,7 +397,16 @@ def _on_event(event: dict) -> None:
     CYAN = "\033[36m"
     RESET = "\033[0m"
 
-    if etype == "tokens":
+    if etype == "turn_start":
+        # Reset the response buffer for the next turn so text from the
+        # previous turn doesn't accumulate with the new turn's text.
+        _streamed_any = False
+        _response_buffer.reset()
+        _response_complete = ""
+        _response_md = None
+        _response_renderable = None
+
+    elif etype == "tokens":
         _print_tokens(event)
 
     elif etype == "thinking":
@@ -412,10 +442,10 @@ def _on_event(event: dict) -> None:
         args = event.get("arguments", {})
 
         def _print_truncated(lines, prefix, color):
-            if len(lines) > 5:
-                for line in lines[:5]:
+            if len(lines) > DISPLAY_TRUNCATION_LIMIT:
+                for line in lines[:DISPLAY_TRUNCATION_LIMIT]:
                     print(f"{prefix}{color}{line}{RESET}", flush=True)
-                print(f"     └─ {color}... truncated: {len(lines) - 5} of {len(lines)} lines hidden (full content sent to agent){RESET}", flush=True)
+                print(f"     └─ {color}... truncated: {len(lines) - DISPLAY_TRUNCATION_LIMIT} of {len(lines)} lines hidden (full content sent to agent){RESET}", flush=True)
             else:
                 for line in lines:
                     print(f"{prefix}{color}{line}{RESET}", flush=True)
@@ -475,10 +505,10 @@ def _on_event(event: dict) -> None:
         # margin (which made indented / long file content unreadable).
         result_prefix = "     │ "
         wrap_width = _available_width(cell_len(result_prefix))
-        if len(lines) > 5:
-            hidden = len(lines) - 5
+        if len(lines) > DISPLAY_TRUNCATION_LIMIT:
+            hidden = len(lines) - DISPLAY_TRUNCATION_LIMIT
             total = len(lines)
-            for line in lines[:5]:
+            for line in lines[:DISPLAY_TRUNCATION_LIMIT]:
                 for chunk in _wrap_line(line, wrap_width):
                     print(f"{result_prefix}{color}{chunk}{RESET}", flush=True)
             print(f"     └─ {color}... truncated: {hidden} of {total} lines hidden (full output received by agent){RESET}", flush=True)
@@ -585,7 +615,7 @@ def _build_token_text(event: dict, max_width: Optional[int] = None,
     cache_full_text = None
     cache_raw_text = None
     if cached_tk > 0:
-        cache_rate = (cached_tk / total_tk * 100) if total_tk > 0 else 0
+        cache_rate = (cached_tk / input_tk * 100) if input_tk > 0 else 0
         cache_raw_text = f"Cache:{cached_tk:,}"
         cache_full_text = f"Cache:{cached_tk:,} ({cache_rate:.1f}%)"
         optional.append((cache_full_text, "yellow"))
@@ -726,7 +756,7 @@ def _fetch_models(base_url: str, api_key: Optional[str] = None,
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     try:
-        resp = httpx.get(url, headers=headers, timeout=10.0)
+        resp = httpx.get(url, headers=headers, timeout=FETCH_TIMEOUT)
         resp.raise_for_status()
         data = resp.json()
         models = [m["id"] for m in data.get("data", [])]
@@ -792,175 +822,28 @@ def _read_multiline_context() -> Optional[str]:
         return None
     return "\n".join(lines)
 
-
-def _prompt_model_selection_numeric(models: List[str], current_model: str) -> Optional[str]:
-    """Numeric fallback for selecting a model when interactive input isn't available."""
-    print("\n📋 Available models:")
-    print("─" * 50)
-    for i, model in enumerate(models, 1):
-        marker = " → " if model == current_model else "   "
-        print(f"{marker}{i:2d}. {model}")
-    print("─" * 50)
-    print(f"Current model: {current_model}")
-    print()
-
-    try:
-        choice = input("Select model number (or press Enter to cancel): ").strip()
-        if not choice:
-            return None
-        idx = int(choice)
-        if 1 <= idx <= len(models):
-            return models[idx - 1]
-        else:
-            print(f"❌ Invalid selection. Please enter 1-{len(models)}.")
-            return None
-    except ValueError:
-        print("❌ Invalid input. Please enter a number.")
-        return None
-
-
-def _interactive_select(options: List[str], current: str, title: str, current_label: str = "Current model") -> Optional[str]:
-    """Show a lightweight inline list selector using the arrow keys.
-
-    Renders at the current cursor position without clearing the screen, so the
-    existing terminal contents stay visible. Returns the selected option or None.
-    """
-    if not options:
-        return None
-
-    print(f"\n{title}:")
-    print("─" * 50)
-    print(f"{current_label}: {current}")
-    print("Use ↑/↓ to navigate, Enter to select, Esc to cancel.\n")
-
-    index = options.index(current) if current in options else 0
-    result: List[Optional[str]] = [None]
-
-    kb = KeyBindings()
-
-    @kb.add("up")
-    def _up(event) -> None:
-        nonlocal index
-        index = (index - 1) % len(options)
-        event.app.invalidate()
-
-    @kb.add("down")
-    def _down(event) -> None:
-        nonlocal index
-        index = (index + 1) % len(options)
-        event.app.invalidate()
-
-    @kb.add("enter")
-    def _enter(event) -> None:
-        result[0] = options[index]
-        event.app.exit()
-
-    @kb.add("escape")
-    @kb.add("c-c")
-    def _cancel(event) -> None:
-        event.app.exit()
-
-    def _get_text():
-        fragments = []
-        for i, opt in enumerate(options):
-            pointer = "> " if i == index else "  "
-            style = "reverse bold" if i == index else ""
-            fragments.append((style, f"{pointer}{opt}\n"))
-        return fragments
-
-    control = FormattedTextControl(_get_text)
-    layout = Layout(
-        Window(control, height=len(options), wrap_lines=False)
-    )
-    app = Application(
-        layout=layout,
-        key_bindings=kb,
-        full_screen=False,
-        erase_when_done=False,
-        mouse_support=True,
-    )
-    app.run()
-    return result[0]
-
-
 def _prompt_model_selection(models: List[str], current_model: str) -> Optional[str]:
-    """Display models and let the user pick one using arrow keys + Enter.
-
-    Falls back to numeric input when stdin is not an interactive terminal.
-    """
-    if not models:
-        print("No models available.")
-        return None
-
-    if not sys.stdin.isatty():
-        return _prompt_model_selection_numeric(models, current_model)
-
-    try:
-        return _interactive_select(models, current_model, title="📋 Available models")
-    except Exception as e:
-        print(f"❌ Interactive selection failed ({e}); falling back to numeric input.")
-        return _prompt_model_selection_numeric(models, current_model)
+    """Display models and let the user pick one (delegates to prompts module)."""
+    return prompts.prompt_selection(
+        models, current_model, title="📋 Available models",
+    )
 
 
-REASONING_OPTIONS = ["low", "medium", "high", "xhigh", "max"]
-
-
-def _prompt_reasoning_selection_numeric(current_effort: Optional[str]) -> Optional[str]:
-    """Numeric fallback for reasoning effort selection when not a TTY."""
-    print("\n🧠 Reasoning effort:")
-    print("─" * 30)
-    for i, level in enumerate(REASONING_OPTIONS, 1):
-        marker = " → " if level == (current_effort or "high") else "   "
-        print(f"{marker}{i}. {level}")
-    print("─" * 30)
-    print(f"Current: {current_effort or 'high'}")
-    print()
-
-    try:
-        choice = input("Select level number (or press Enter to cancel): ").strip()
-        if not choice:
-            return None
-        idx = int(choice)
-        if 1 <= idx <= len(REASONING_OPTIONS):
-            return REASONING_OPTIONS[idx - 1]
-        else:
-            print(f"❌ Invalid selection. Please enter 1-{len(REASONING_OPTIONS)}.")
-            return None
-    except ValueError:
-        print("❌ Invalid input. Please enter a number.")
-        return None
+REASONING_OPTIONS = _REASONING_OPTIONS_CONST
 
 
 def _prompt_reasoning_selection(current_effort: Optional[str]) -> Optional[str]:
-    """Display reasoning options and let the user pick one using arrow keys + Enter.
-
-    Falls back to numeric input when stdin is not an interactive terminal.
-    """
+    """Display reasoning options and let the user pick one (delegates to prompts)."""
     current = current_effort or "high"
-
-    if not sys.stdin.isatty():
-        return _prompt_reasoning_selection_numeric(current_effort)
-
-    try:
-        return _interactive_select(
-            REASONING_OPTIONS, current, title="🧠 Reasoning effort",
-            current_label="Current effort",
-        )
-    except Exception as e:
-        print(f"❌ Interactive selection failed ({e}); falling back to numeric input.")
-        return _prompt_reasoning_selection_numeric(current_effort)
+    return prompts.prompt_selection(
+        REASONING_OPTIONS, current,
+        title="🧠 Reasoning effort", current_label="Current effort",
+    )
 
 
 def _disp_width(s: str) -> int:
     """Return the terminal display width of *s* (handles wide chars like emoji)."""
-    try:
-        from wcwidth import wcswidth
-        w = wcswidth(s)
-        if w >= 0:
-            return w
-    except ImportError:
-        pass
-    return len(s)
+    return cell_len(s)
 
 
 def _pad_to_width(s: str, width: int) -> str:
@@ -1003,13 +886,114 @@ def _build_welcome_box(model: str, reasoning_effort: str, context_window: int, w
     return "\n".join(result)
 
 
+# ── Slash-command dispatch ──────────────────────────────────────────────────
+
+
+class DispatchResult(enum.Enum):
+    """Result of dispatching a user input string."""
+    CONTINUE = "continue"   # handled a slash command; loop again
+    EXIT = "exit"           # user wants to quit
+    RUN_AGENT = "agent"     # not a slash command; pass to the agent
+
+
+def _dispatch_slash_command(
+    user_input: str,
+    agent: Any,
+    fetcher: Any,
+    current_model: List[str],  # mutable [model_name]
+    use_stream: List[bool],    # mutable [streaming_enabled]
+    args: Any,
+) -> DispatchResult:
+    """Dispatch a slash command. Returns what the REPL should do next.
+
+    ``current_model`` and ``use_stream`` are passed as single-element lists
+    so the function can mutate the caller's state without ``nonlocal``.
+    """
+    cmd = user_input.lower()
+
+    if cmd == "/exit":
+        _clear_status_bar()
+        print("Goodbye!")
+        return DispatchResult.EXIT
+
+    if cmd == "/clear":
+        agent.clear_history()
+        os.system('cls' if os.name == 'nt' else 'clear')
+        print(_build_welcome_box(
+            current_model[0], agent.reasoning_effort,
+            args.context_window, args.dir, use_stream[0],
+        ))
+        print()
+        if fetcher.ready:
+            models = fetcher.get()
+            if models:
+                print(f"📦 {len(models)} models loaded. Use /models to switch.\n")
+            else:
+                print("⚠️ Could not pre-fetch models — /models will retry on demand.\n")
+        else:
+            print("📦 Loading models in background… Use /models to browse.\n")
+        print("🔄 History cleared.\n")
+        return DispatchResult.CONTINUE
+
+    if cmd == "/stream":
+        use_stream[0] = not use_stream[0]
+        status = "enabled" if use_stream[0] else "disabled"
+        print(f"✅ Streaming {status}.")
+        return DispatchResult.CONTINUE
+
+    if cmd == "/models":
+        models = fetcher.get()
+        if not models:
+            print("\nFetching models...")
+            fetcher.refresh()
+            models = fetcher.get()
+        selected = _prompt_model_selection(models, current_model[0])
+        if selected and selected != current_model[0]:
+            current_model[0] = selected
+            agent.model = selected
+            print(f"✅ Model changed to: {selected}")
+        return DispatchResult.CONTINUE
+
+    if cmd == "/reasoning":
+        selected = _prompt_reasoning_selection(agent.reasoning_effort)
+        if selected and selected != agent.reasoning_effort:
+            agent.reasoning_effort = selected
+            print(f"✅ Reasoning effort set to: {selected}")
+        return DispatchResult.CONTINUE
+
+    if cmd == "/context":
+        ctx = _read_multiline_context()
+        if ctx is not None:
+            agent.set_custom_context(ctx)
+            print(f"✅ Custom context set ({len(ctx.splitlines())} lines).")
+        return DispatchResult.CONTINUE
+
+    if cmd == "/context clear":
+        agent.set_custom_context(None)
+        print("✅ Custom context cleared.")
+        return DispatchResult.CONTINUE
+
+    if cmd == "/context show":
+        ctx = agent.get_custom_context()
+        if ctx:
+            print(f"\n📋 Current custom context ({len(ctx.splitlines())} lines):\n{'─'*40}")
+            print(ctx)
+            print("─" * 40)
+        else:
+            print("No custom context set. Use /context to add one.")
+        return DispatchResult.CONTINUE
+
+    return DispatchResult.RUN_AGENT
+
+
 def main(argv: Optional[list] = None) -> None:
     global _console, _live, _no_markdown
     args = _build_parser().parse_args(argv)
     _no_markdown = args.no_markdown
+    _console = None  # Reset for each new session; created lazily on first prompt
 
     # Determine streaming mode
-    use_stream = args.stream and not args.no_stream
+    use_stream = args.stream
 
     system_prompt = args.system_prompt or os.environ.get("HARNESS_PROMPT")
 
@@ -1033,6 +1017,17 @@ def main(argv: Optional[list] = None) -> None:
     fetcher = _ModelFetcher(args.base_url, args.api_key)
     print("📦 Loading models in background… Use /models to browse.\n")
 
+    # Validate reasoning effort compatibility with the configured provider.
+    reasoning_warn = _check_reasoning_compatibility(args.base_url, args.reasoning_effort)
+    if reasoning_warn:
+        print(reasoning_warn + "\n")
+
+    model_checked = False
+
+    # Mutable state containers so the dispatch function can update them.
+    model_state = [current_model]
+    stream_state = [use_stream]
+
     while True:
         try:
             user_input = input("▸ ").strip()
@@ -1044,86 +1039,34 @@ def main(argv: Optional[list] = None) -> None:
         if not user_input:
             continue
 
-        if user_input.lower() == "/exit":
-            _clear_status_bar()
-            print("Goodbye!")
+        result = _dispatch_slash_command(
+            user_input, agent, fetcher, model_state, stream_state, args,
+        )
+        if result == DispatchResult.EXIT:
             break
-
-        if user_input.lower() == "/clear":
-            agent.clear_history()
-            # Clear the screen (cross-platform)
-            os.system('cls' if os.name == 'nt' else 'clear')
-            # Redisplay the welcome banner
-            print(_build_welcome_box(current_model, agent.reasoning_effort, args.context_window, args.dir, use_stream))
-            print()
-            if fetcher.ready:
-                models = fetcher.get()
-                if models:
-                    print(f"📦 {len(models)} models loaded. Use /models to switch.\n")
-                else:
-                    print("⚠️ Could not pre-fetch models — /models will retry on demand.\n")
-            else:
-                print("📦 Loading models in background… Use /models to browse.\n")
-            print("🔄 History cleared.\n")
+        if result == DispatchResult.CONTINUE:
             continue
 
-        if user_input.lower() == "/stream":
-            use_stream = not use_stream
-            status = "enabled" if use_stream else "disabled"
-            print(f"✅ Streaming {status}.")
-            continue
-
-        if user_input.lower() == "/models":
-            # Wait for the background fetch, then retry synchronously if empty.
-            models = fetcher.get()
-            if not models:
-                print("\nFetching models...")
-                fetcher.refresh()
-                models = fetcher.get()
-            selected = _prompt_model_selection(models, current_model)
-            if selected and selected != current_model:
-                current_model = selected
-                agent.model = selected
-                print(f"✅ Model changed to: {selected}")
-            continue
-
-        if user_input.lower() == "/reasoning":
-            selected = _prompt_reasoning_selection(agent.reasoning_effort)
-            if selected and selected != agent.reasoning_effort:
-                agent.reasoning_effort = selected
-                print(f"✅ Reasoning effort set to: {selected}")
-            continue
-
-        if user_input.lower() == "/context":
-            ctx = _read_multiline_context()
-            if ctx is not None:
-                agent.set_custom_context(ctx)
-                print(f"✅ Custom context set ({len(ctx.splitlines())} lines).")
-            continue
-
-        if user_input.lower() == "/context clear":
-            agent.set_custom_context(None)
-            print("✅ Custom context cleared.")
-            continue
-
-        if user_input.lower() == "/context show":
-            ctx = agent.get_custom_context()
-            if ctx:
-                print(f"\n📋 Current custom context ({len(ctx.splitlines())} lines):\n{'─'*40}")
-                print(ctx)
-                print("─" * 40)
-            else:
-                print("No custom context set. Use /context to add one.")
-            continue
+        # RUN_AGENT: fall through to the agent execution block below
+        current_model = model_state[0]
+        use_stream = stream_state[0]
 
         # Run the agent with live progress
+        if not model_checked and fetcher.ready:
+            model_warn = _check_model_available(current_model, fetcher.get())
+            if model_warn:
+                print(model_warn + "\n")
+        model_checked = True
+
         print(flush=True)
-        _console = _make_console()
+        # Create the console once and reuse it for all subsequent prompts.
+        if _console is None:
+            _console = _make_console()
 
         if use_stream:
             # Streaming mode: response text is rendered live via callbacks.
             _reset_stream_state()
-            _live = Live(Text(), console=_console, refresh_per_second=12, transient=False)
+            _live = Live(Text(), console=_console, refresh_per_second=LIVE_REFRESH_STREAMING, transient=False)
             _live.start()
             try:
                 response = agent.run(user_input, callback=_on_event, stream=True)
@@ -1138,7 +1081,7 @@ def main(argv: Optional[list] = None) -> None:
         else:
             # Non-streaming mode: wait for complete response
             _reset_stream_state()
-            _live = Live(Text(), console=_console, refresh_per_second=4, transient=False)
+            _live = Live(Text(), console=_console, refresh_per_second=LIVE_REFRESH_NON_STREAMING, transient=False)
             _live.start()
             try:
                 response = agent.run(user_input, callback=_on_event)

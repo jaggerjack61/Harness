@@ -1,15 +1,55 @@
 """Tool definitions and executors for the Nasa Level Genius Agent."""
 
 import itertools
+import os
 import platform
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from harness.constants import MAX_OUTPUT_LINES, BASH_TIMEOUT
+
+
+# ── Windows shell resolution ───────────────────────────────────────────────
+
+_WINDOWS_SHELL: Optional[str] = None
+
+
+def _get_windows_shell() -> str:
+    """Find the PowerShell executable, preferring pwsh (7+) over powershell (5.1).
+
+    Checks the ``HARNESS_SHELL`` env var first (user override), then probes
+    for ``pwsh`` and ``powershell`` on PATH. Falls back to ``powershell``
+    so the OS produces a clear error if neither is installed.
+    """
+    global _WINDOWS_SHELL
+    if _WINDOWS_SHELL is not None:
+        return _WINDOWS_SHELL
+    override = os.environ.get("HARNESS_SHELL")
+    if override:
+        _WINDOWS_SHELL = override
+        return _WINDOWS_SHELL
+    for candidate in ("pwsh", "powershell"):
+        if shutil.which(candidate):
+            _WINDOWS_SHELL = candidate
+            return _WINDOWS_SHELL
+    _WINDOWS_SHELL = "powershell"
+    return _WINDOWS_SHELL
+
+
+def _resolve_path(path: str, cwd: Optional[str] = None) -> Path:
+    """Resolve a path against cwd if relative, then follow symlinks.
+
+    DRY: shared by read/write/edit_file to avoid copy-pasted resolution.
+    """
+    p = Path(path)
+    if cwd and not p.is_absolute():
+        p = Path(cwd) / p
+    return p.resolve()
+
 
 # ── Output limits ──────────────────────────────────────────────────────────
-
-MAX_OUTPUT_LINES = 1000
 
 
 def _enforce_line_limit(result: str, tool_name: str) -> str:
@@ -161,10 +201,7 @@ def read_file(path: str, offset: Optional[int] = None, limit: Optional[int] = No
     Returns:
         File contents as a string, or an error message.
     """
-    p = Path(path)
-    if cwd and not p.is_absolute():
-        p = Path(cwd) / p
-    p = p.resolve()
+    p = _resolve_path(path, cwd)
 
     if not p.exists():
         return f"Error: File not found: {path}"
@@ -195,10 +232,7 @@ def write_file(path: str, content: str, cwd: Optional[str] = None) -> str:
     Returns:
         Success or error message.
     """
-    p = Path(path)
-    if cwd and not p.is_absolute():
-        p = Path(cwd) / p
-    p = p.resolve()
+    p = _resolve_path(path, cwd)
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
@@ -218,10 +252,7 @@ def edit_file(path: str, edits: List[Dict[str, str]], cwd: Optional[str] = None)
     Returns:
         Success or error message.
     """
-    p = Path(path)
-    if cwd and not p.is_absolute():
-        p = Path(cwd) / p
-    p = p.resolve()
+    p = _resolve_path(path, cwd)
     if not p.exists():
         return f"Error: File not found: {path}"
 
@@ -230,12 +261,25 @@ def edit_file(path: str, edits: List[Dict[str, str]], cwd: Optional[str] = None)
     except Exception as e:
         return f"Error reading file: {e}"
 
+    positions: List[tuple] = []
     for i, edit in enumerate(edits):
         old = edit["oldText"]
         new = edit["newText"]
-        if old not in text:
+        count = text.count(old)
+        if count == 0:
             return f"Error: Edit {i}: oldText not found in file."
-        text = text.replace(old, new, 1)  # Replace first occurrence only
+        if count > 1:
+            return f"Error: Edit {i}: oldText found {count} times — provide more context to uniquely identify the location."
+        pos = text.index(old)
+        edit_end = pos + len(old)
+        for prev_start, prev_end, prev_i in positions:
+            if pos < prev_end and edit_end > prev_start:
+                return f"Error: Edit {i} overlaps with edit {prev_i}."
+        positions.append((pos, edit_end, i))
+
+    # Apply edits from last position to first so earlier offsets aren't shifted.
+    for pos, edit_end, i in sorted(positions, key=lambda p: p[0], reverse=True):
+        text = text[:pos] + edits[i]["newText"] + text[edit_end:]
 
     try:
         p.write_text(text, encoding="utf-8")
@@ -256,13 +300,14 @@ def run_bash(command: str, cwd: Optional[str] = None) -> str:
     """
     try:
         if platform.system() == "Windows":
+            shell = _get_windows_shell()
             result = subprocess.run(
-                ["powershell", "-NoProfile", "-Command", command],
+                [shell, "-NoProfile", "-Command", command],
                 capture_output=True,
                 encoding="utf-8",
                 errors="replace",
                 cwd=cwd,
-                timeout=60,
+                timeout=BASH_TIMEOUT,
             )
         else:
             result = subprocess.run(
@@ -272,7 +317,7 @@ def run_bash(command: str, cwd: Optional[str] = None) -> str:
                 encoding="utf-8",
                 errors="replace",
                 cwd=cwd,
-                timeout=60,
+                timeout=BASH_TIMEOUT,
             )
         output = result.stdout
         if result.stderr:
@@ -281,7 +326,7 @@ def run_bash(command: str, cwd: Optional[str] = None) -> str:
             output += f"\n[Exit code: {result.returncode}]"
         return output.strip() if output.strip() else "(no output)"
     except subprocess.TimeoutExpired:
-        return "Error: Command timed out after 60 seconds."
+        return f"Error: Command timed out after {BASH_TIMEOUT} seconds."
     except Exception as e:
         return f"Error executing command: {e}"
 

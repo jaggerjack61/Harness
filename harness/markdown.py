@@ -98,10 +98,13 @@ def markdown_to_plain(text: str, width: int = 100) -> str:
     Returns:
         Rendered text representation of the markdown.
     """
-    console = _make_console(width=width, no_color=True)
+    buf = StringIO()
+    console = Console(file=buf, width=width, no_color=True, force_terminal=False, theme=_MARKDOWN_THEME)
     try:
         md = Markdown(text)
         console.print(md)
     except MarkupError:
         console.print(rich_escape(text))
-    return console.file.getvalue()
+    value = buf.getvalue()
+    buf.close()
+    return value

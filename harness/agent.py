@@ -2,10 +2,21 @@
 
 import json
 import os
+import random
+import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from openai import OpenAI
 
+from harness.constants import (
+    DEFAULT_MAX_TURNS,
+    DEFAULT_CONTEXT_WINDOW,
+    MAX_RETRIES,
+    RETRY_BASE_DELAY,
+    CONTEXT_WINDOW_TRIM_THRESHOLD,
+    RECENT_TURNS_TO_KEEP,
+    SUMMARY_MAX_TOKENS,
+)
 from harness.tools import ToolRegistry
 
 DEFAULT_SYSTEM_PROMPT = """You are an expert coding assistant. You have access to the following tools:
@@ -31,6 +42,7 @@ _REASONING_EXTRA_KEYS: Tuple[str, ...] = (
     "thinking",
     "thought",
 )
+
 
 
 def _extract_reasoning_fields(obj: Any) -> Optional[str]:
@@ -72,9 +84,9 @@ class AgentHarness:
         base_url: Optional[str] = None,
         system_prompt: Optional[str] = None,
         working_dir: Optional[str] = None,
-        max_turns: int = 1000,
+        max_turns: int = DEFAULT_MAX_TURNS,
         reasoning_effort: Optional[str] = None,
-        context_window: int = 1000000,
+        context_window: int = DEFAULT_CONTEXT_WINDOW,
     ):
         self.model = model
         self.system_prompt = system_prompt or DEFAULT_SYSTEM_PROMPT
@@ -99,8 +111,31 @@ class AgentHarness:
         self.input_tokens: int = 0
         self.output_tokens: int = 0
         self.cached_tokens: int = 0
+        # Last API call's prompt_tokens — used to estimate current history size.
+        self._last_prompt_tokens: int = 0
 
     # ── Public API ──────────────────────────────────────────────────────
+
+    def _create_with_retry(self, **kwargs: Any) -> Any:
+        """Call the API with retry on transient errors (429/5xx/timeout)."""
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                return self.client.chat.completions.create(**kwargs)
+            except Exception as e:
+                if attempt == MAX_RETRIES or not self._is_retryable(e):
+                    raise
+                delay = RETRY_BASE_DELAY * (2 ** attempt) + random.uniform(0, 0.5)
+                time.sleep(delay)
+
+    @staticmethod
+    def _is_retryable(e: Exception) -> bool:
+        """Check if an exception is a transient error worth retrying."""
+        status = getattr(e, "status_code", None)
+        if status is not None:
+            return status == 429 or 500 <= status < 600
+        if isinstance(e, (TimeoutError, ConnectionError)):
+            return True
+        return False
 
     def run(
         self,
@@ -113,16 +148,6 @@ class AgentHarness:
         Args:
             prompt: The user's request.
             callback: Optional callable receiving progress events as dicts.
-                Event types:
-                - {"type": "tokens", "input_tokens": N, "output_tokens": N, ...}  (live token usage after each API call)
-                - {"type": "thinking", "content": "..."}  (reasoning/chain-of-thought, non-streaming)
-                - {"type": "thinking_delta", "content": "..."}  (incremental reasoning, streaming only)
-                - {"type": "thinking_end"}  (end of a streaming reasoning block)
-                - {"type": "text", "content": "..."}  (model text response, non-streaming)
-                - {"type": "text_delta", "content": "..."}  (incremental text, streaming only)
-                - {"type": "text_end", "content": "..."}  (final complete text, streaming only)
-                - {"type": "tool_call", "name": "...", "arguments": {...}}
-                - {"type": "tool_result", "name": "...", "result": "..."}
             stream: If True, stream text output token by token.
 
         Returns:
@@ -133,129 +158,153 @@ class AgentHarness:
         else:
             self.messages.append({"role": "user", "content": prompt})
 
-        for _ in range(self.max_turns):
-            create_kwargs: Dict[str, Any] = {
-                "model": self.model,
-                "messages": self.messages,
-                "tools": self.tool_registry.get_definitions(),
-            }
-            if self.reasoning_effort is not None:
-                create_kwargs["reasoning_effort"] = self.reasoning_effort
+        self._trim_history(callback)
 
+        for turn_idx in range(self.max_turns):
+            if turn_idx > 0 and callback:
+                callback({"type": "turn_start"})
+
+            create_kwargs = self._build_create_kwargs()
             if stream:
-                # Streaming mode
                 create_kwargs["stream"] = True
-                response_stream = self.client.chat.completions.create(**create_kwargs)
-                text, reasoning, tool_calls, usage = self._process_stream(response_stream, callback)
+                create_kwargs["stream_options"] = {"include_usage": True}
 
-                # Track token usage per-turn and emit live stats event.
-                turn_input = turn_output = turn_cached = 0
-                if usage:
-                    turn_input = usage.get('prompt_tokens', 0) or 0
-                    turn_output = usage.get('completion_tokens', 0) or 0
-                    pts = usage.get('prompt_tokens_details') or {}
-                    turn_cached = pts.get('cached_tokens', 0) or 0
-                self._track_and_emit_tokens(turn_input, turn_output, turn_cached, callback)
-            else:
-                # Non-streaming mode
-                response = self.client.chat.completions.create(**create_kwargs)
-
-                # Track token usage per-turn and emit live stats event.
-                turn_input = turn_output = turn_cached = 0
-                if hasattr(response, 'usage') and response.usage:
-                    turn_input = response.usage.prompt_tokens or 0
-                    turn_output = response.usage.completion_tokens or 0
-                    if response.usage.prompt_tokens_details:
-                        pts = response.usage.prompt_tokens_details
-                        if hasattr(pts, 'cached_tokens') and pts.cached_tokens:
-                            turn_cached = pts.cached_tokens
-                self._track_and_emit_tokens(turn_input, turn_output, turn_cached, callback)
-
-                text, reasoning, tool_calls = self._parse_response(response)
-
-            # Emit thinking/reasoning if present (before tool calls or text).
-            # In streaming mode, _process_stream already emitted thinking_delta
-            # events, so we only emit the full thinking block here for the
-            # non-streaming path.
-            if reasoning and callback and not stream:
-                callback({
-                    "type": "thinking",
-                    "content": reasoning,
-                })
+            response = self._create_with_retry(**create_kwargs)
+            text, reasoning, tool_calls = self._process_response(response, stream, callback)
 
             if tool_calls:
-                # Add assistant message with tool calls (preserve reasoning for history)
-                msg: Dict[str, Any] = {
-                    "role": "assistant",
-                    "content": text,
-                    "tool_calls": [
-                        {
-                            "id": tc["id"],
-                            "type": "function",
-                            "function": {
-                                "name": tc["name"],
-                                "arguments": json.dumps(tc["arguments"]),
-                            },
-                        }
-                        for tc in tool_calls
-                    ],
-                }
-                if reasoning:
-                    msg["reasoning_content"] = reasoning
-                self.messages.append(msg)
-
-                # Execute each tool, fire events, and add results
-                for tc in tool_calls:
-                    if callback:
-                        callback({
-                            "type": "tool_call",
-                            "name": tc["name"],
-                            "arguments": tc["arguments"],
-                        })
-
-                    try:
-                        result = self.tool_registry.execute(
-                            tc["name"], tc["arguments"]
-                        )
-                    except Exception as e:
-                        result = f"Error: {e}"
-
-                    if callback:
-                        callback({
-                            "type": "tool_result",
-                            "name": tc["name"],
-                            "result": result,
-                        })
-
-                    self.messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tc["id"],
-                            "content": result,
-                        }
-                    )
+                self._handle_tool_calls(text, tool_calls, callback)
             else:
-                # Final text response (preserve reasoning for history)
-                msg = {"role": "assistant", "content": text}
-                if reasoning:
-                    msg["reasoning_content"] = reasoning
-                self.messages.append(msg)
-
-                if stream and callback:
-                    # Emit text_end event with the complete text
-                    callback({
-                        "type": "text_end",
-                        "content": text or "",
-                    })
-                elif callback:
-                    callback({
-                        "type": "text",
-                        "content": text or "",
-                    })
-
-                return text or ""
+                return self._finalize_response(text, stream, callback)
 
         return "Max turns reached without a final response."
+
+    def _build_create_kwargs(self) -> Dict[str, Any]:
+        """Build the kwargs dict for the next chat.completions.create call."""
+        kwargs: Dict[str, Any] = {
+            "model": self.model,
+            "messages": self.messages,
+            "tools": self.tool_registry.get_definitions(),
+        }
+        if self.reasoning_effort is not None:
+            kwargs["reasoning_effort"] = self.reasoning_effort
+        return kwargs
+
+    def _process_response(
+        self,
+        response: Any,
+        stream: bool,
+        callback: Optional[Callable[..., Any]],
+    ) -> Tuple[Optional[str], Optional[str], List[Dict[str, Any]]]:
+        """Extract text/reasoning/tool_calls from a streaming or non-streaming response.
+
+        Also tracks tokens and emits the thinking event (non-streaming) and
+        finish_reason warning (non-streaming).
+        """
+        if stream:
+            text, reasoning, tool_calls, usage = self._process_stream(response, callback)
+        else:
+            text, reasoning, tool_calls = self._parse_response(response)
+            usage = None
+
+        self._track_and_emit_tokens_from_usage(usage, response, stream, callback)
+
+        if not stream and callback:
+            self._maybe_emit_finish_reason(response, text, callback)
+        if reasoning and callback and not stream:
+            callback({"type": "thinking", "content": reasoning})
+
+        return text, reasoning, tool_calls
+
+    def _track_and_emit_tokens_from_usage(
+        self,
+        usage: Optional[Dict[str, Any]],
+        response: Any,
+        stream: bool,
+        callback: Optional[Callable[..., Any]],
+    ) -> None:
+        """Track per-turn tokens from streaming usage dict or non-streaming response."""
+        if stream and usage:
+            turn_input = usage.get("prompt_tokens", 0) or 0
+            turn_output = usage.get("completion_tokens", 0) or 0
+            pts = usage.get("prompt_tokens_details") or {}
+            turn_cached = pts.get("cached_tokens", 0) or 0
+        elif not stream and hasattr(response, "usage") and response.usage:
+            turn_input = response.usage.prompt_tokens or 0
+            turn_output = response.usage.completion_tokens or 0
+            pts = getattr(response.usage, "prompt_tokens_details", None)
+            turn_cached = (getattr(pts, "cached_tokens", 0) or 0) if pts else 0
+        else:
+            turn_input = turn_output = turn_cached = 0
+        self._track_and_emit_tokens(turn_input, turn_output, turn_cached, callback)
+
+    @staticmethod
+    def _maybe_emit_finish_reason(
+        response: Any,
+        text: Optional[str],
+        callback: Callable[..., Any],
+    ) -> None:
+        """Emit a finish_reason warning for non-standard stop reasons."""
+        if not response.choices:
+            return
+        finish_reason = response.choices[0].finish_reason
+        if isinstance(finish_reason, str) and finish_reason not in ("stop", "tool_calls"):
+            callback({"type": "finish_reason", "reason": finish_reason, "content": text or ""})
+
+    def _handle_tool_calls(
+        self,
+        text: Optional[str],
+        tool_calls: List[Dict[str, Any]],
+        callback: Optional[Callable[..., Any]],
+    ) -> None:
+        """Append assistant msg, execute tools, append results, emit events."""
+        msg: Dict[str, Any] = {
+            "role": "assistant",
+            "content": text,
+            "tool_calls": [
+                {
+                    "id": tc["id"],
+                    "type": "function",
+                    "function": {
+                        "name": tc["name"],
+                        "arguments": json.dumps(tc["arguments"]),
+                    },
+                }
+                for tc in tool_calls
+            ],
+        }
+        self.messages.append(msg)
+
+        for tc in tool_calls:
+            if callback:
+                callback({"type": "tool_call", "name": tc["name"], "arguments": tc["arguments"]})
+
+            try:
+                result = self.tool_registry.execute(tc["name"], tc["arguments"])
+            except Exception as e:
+                result = f"Error: {e}"
+
+            if callback:
+                callback({"type": "tool_result", "name": tc["name"], "result": result})
+
+            self.messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+
+        if text and callback:
+            callback({"type": "text_end", "content": text})
+
+    def _finalize_response(
+        self,
+        text: Optional[str],
+        stream: bool,
+        callback: Optional[Callable[..., Any]],
+    ) -> str:
+        """Append final assistant msg, emit text/text_end, return text."""
+        self.messages.append({"role": "assistant", "content": text})
+        if stream and callback:
+            callback({"type": "text_end", "content": text or ""})
+        elif callback:
+            callback({"type": "text", "content": text or ""})
+        return text or ""
 
     def _process_stream(
         self,
@@ -271,105 +320,162 @@ class AgentHarness:
         Returns:
             A tuple of (text_content, reasoning_content, list_of_tool_calls, usage_dict).
         """
-        text_chunks: List[str] = []
-        reasoning_chunks: List[str] = []
-        thinking_open = False  # whether a thinking_delta block is currently open
-        tool_calls_map: Dict[int, Dict[str, Any]] = {}  # index -> {id, name, arguments_str}
-        usage = None
-
-        def _close_thinking() -> None:
-            nonlocal thinking_open
-            if thinking_open and callback:
-                callback({"type": "thinking_end"})
-            thinking_open = False
+        state = {
+            "text_chunks": [],
+            "reasoning_chunks": [],
+            "thinking_open": False,
+            "tool_calls_map": {},
+            "usage": None,
+            "last_finish_reason": None,
+        }
 
         for chunk in stream:
-            # Extract usage from the final chunk if available
-            if hasattr(chunk, 'usage') and chunk.usage:
-                usage = {
-                    'prompt_tokens': chunk.usage.prompt_tokens,
-                    'completion_tokens': chunk.usage.completion_tokens,
-                    'prompt_tokens_details': {}
-                }
-                if chunk.usage.prompt_tokens_details:
-                    pts = chunk.usage.prompt_tokens_details
-                    if hasattr(pts, 'cached_tokens'):
-                        usage['prompt_tokens_details']['cached_tokens'] = pts.cached_tokens
-
+            self._collect_stream_usage(chunk, state)
             if not chunk.choices:
                 continue
+            self._handle_stream_chunk(chunk.choices[0], callback, state)
 
-            delta = chunk.choices[0].delta
-            finish_reason = chunk.choices[0].finish_reason
+        return self._finalize_stream(state, callback)
 
-            # Handle text content
-            if delta.content:
-                text_chunks.append(delta.content)
-                if callback:
-                    callback({
-                        "type": "text_delta",
-                        "content": delta.content,
-                    })
+    def _collect_stream_usage(self, chunk: Any, state: Dict[str, Any]) -> None:
+        """Extract usage from the final chunk if available."""
+        if not (hasattr(chunk, "usage") and chunk.usage):
+            return
+        usage = {
+            "prompt_tokens": chunk.usage.prompt_tokens,
+            "completion_tokens": chunk.usage.completion_tokens,
+            "prompt_tokens_details": {},
+        }
+        if chunk.usage.prompt_tokens_details:
+            pts = chunk.usage.prompt_tokens_details
+            if hasattr(pts, "cached_tokens"):
+                usage["prompt_tokens_details"]["cached_tokens"] = pts.cached_tokens
+        state["usage"] = usage
 
-            # Handle reasoning content (different providers use different fields).
-            # Accumulate for history, but also emit live thinking_delta events so
-            # the CLI can show reasoning progress as it arrives.
-            reasoning_delta = self._extract_reasoning_delta(delta)
-            if reasoning_delta:
-                reasoning_chunks.append(reasoning_delta)
-                thinking_open = True
-                if callback:
-                    callback({
-                        "type": "thinking_delta",
-                        "content": reasoning_delta,
-                    })
+    def _handle_stream_chunk(
+        self,
+        choice: Any,
+        callback: Optional[Callable[..., Any]],
+        state: Dict[str, Any],
+    ) -> None:
+        """Process a single stream choice: text, reasoning, tool calls."""
+        delta = choice.delta
+        finish_reason = choice.finish_reason
+        if finish_reason:
+            state["last_finish_reason"] = finish_reason
 
-            # Handle text content. Once non-reasoning output starts, close the
-            # current thinking block so the CLI can finalize its line.
-            if delta.content:
-                _close_thinking()
+        self._accumulate_text(delta, callback, state)
+        self._accumulate_reasoning(delta, callback, state)
+        self._accumulate_tool_calls(delta, callback, state)
 
-            # Handle tool calls
-            if delta.tool_calls:
-                _close_thinking()
-                for tc_delta in delta.tool_calls:
-                    idx = tc_delta.index
-                    if idx not in tool_calls_map:
-                        tool_calls_map[idx] = {
-                            "id": tc_delta.id or "",
-                            "name": tc_delta.function.name if tc_delta.function and tc_delta.function.name else "",
-                            "arguments_str": "",
-                        }
-                    else:
-                        # Update ID if it arrives in a later chunk
-                        if tc_delta.id:
-                            tool_calls_map[idx]["id"] = tc_delta.id
-                        if tc_delta.function and tc_delta.function.name:
-                            tool_calls_map[idx]["name"] = tc_delta.function.name
+    def _accumulate_text(
+        self,
+        delta: Any,
+        callback: Optional[Callable[..., Any]],
+        state: Dict[str, Any],
+    ) -> None:
+        """Append text content and emit text_delta events."""
+        if not delta.content:
+            return
+        state["text_chunks"].append(delta.content)
+        if callback:
+            callback({"type": "text_delta", "content": delta.content})
+        self._close_thinking(callback, state)
 
-                    if tc_delta.function and tc_delta.function.arguments:
-                        tool_calls_map[idx]["arguments_str"] += tc_delta.function.arguments
+    def _accumulate_reasoning(
+        self,
+        delta: Any,
+        callback: Optional[Callable[..., Any]],
+        state: Dict[str, Any],
+    ) -> None:
+        """Append reasoning content and emit thinking_delta events."""
+        reasoning_delta = self._extract_reasoning_delta(delta)
+        if not reasoning_delta:
+            return
+        state["reasoning_chunks"].append(reasoning_delta)
+        state["thinking_open"] = True
+        if callback:
+            callback({"type": "thinking_delta", "content": reasoning_delta})
 
-        # Parse tool call arguments
-        tool_calls = []
+    def _accumulate_tool_calls(
+        self,
+        delta: Any,
+        callback: Optional[Callable[..., Any]],
+        state: Dict[str, Any],
+    ) -> None:
+        """Accumulate tool call deltas into a map keyed by tool index."""
+        if not delta.tool_calls:
+            return
+        self._close_thinking(callback, state)
+        for tc_delta in delta.tool_calls:
+            tcm = state["tool_calls_map"]
+            idx = tc_delta.index
+            if idx not in tcm:
+                tcm[idx] = {
+                    "id": tc_delta.id or "",
+                    "name": tc_delta.function.name if tc_delta.function and tc_delta.function.name else "",
+                    "arguments_str": "",
+                }
+            elif tc_delta.id:
+                tcm[idx]["id"] = tc_delta.id
+            if tc_delta.function and tc_delta.function.name:
+                tcm[idx]["name"] = tc_delta.function.name
+            if tc_delta.function and tc_delta.function.arguments:
+                tcm[idx]["arguments_str"] += tc_delta.function.arguments
+
+    def _finalize_stream(
+        self,
+        state: Dict[str, Any],
+        callback: Optional[Callable[..., Any]],
+    ) -> Tuple[Optional[str], Optional[str], List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        """After the stream ends, parse tool calls, emit finish_reason, return."""
+        self._close_thinking(callback, state)
+
+        tool_calls = self._parse_streamed_tool_calls(state["tool_calls_map"])
+        self._emit_finish_reason_if_needed(state, callback)
+
+        text = "".join(state["text_chunks"]) if state["text_chunks"] else None
+        reasoning = "".join(state["reasoning_chunks"]) if state["reasoning_chunks"] else None
+        return text, reasoning, tool_calls, state["usage"]
+
+    @staticmethod
+    def _parse_streamed_tool_calls(
+        tool_calls_map: Dict[int, Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Convert the accumulated tool-call map into a sorted list of dicts."""
+        result = []
         for idx in sorted(tool_calls_map.keys()):
             tc = tool_calls_map[idx]
             try:
                 args = json.loads(tc["arguments_str"])
             except (json.JSONDecodeError, TypeError):
                 args = {}
-            tool_calls.append({
-                "id": tc["id"],
-                "name": tc["name"],
-                "arguments": args,
-            })
+            result.append({"id": tc["id"], "name": tc["name"], "arguments": args})
+        return result
 
-        _close_thinking()
+    @staticmethod
+    def _emit_finish_reason_if_needed(
+        state: Dict[str, Any],
+        callback: Optional[Callable[..., Any]],
+    ) -> None:
+        """Emit a finish_reason warning for non-standard stop reasons."""
+        if not callback:
+            return
+        fr = state["last_finish_reason"]
+        if not (isinstance(fr, str) and fr not in ("stop", "tool_calls")):
+            return
+        text_so_far = "".join(state["text_chunks"]) if state["text_chunks"] else ""
+        callback({"type": "finish_reason", "reason": fr, "content": text_so_far})
 
-        text = "".join(text_chunks) if text_chunks else None
-        reasoning = "".join(reasoning_chunks) if reasoning_chunks else None
-
-        return text, reasoning, tool_calls, usage
+    @staticmethod
+    def _close_thinking(
+        callback: Optional[Callable[..., Any]],
+        state: Dict[str, Any],
+    ) -> None:
+        """Emit a thinking_end event if a thinking block is currently open."""
+        if state["thinking_open"] and callback:
+            callback({"type": "thinking_end"})
+        state["thinking_open"] = False
 
     def _extract_reasoning_delta(self, delta: Any) -> Optional[str]:
         """Extract reasoning content from a streaming delta.
@@ -387,6 +493,7 @@ class AgentHarness:
         self.input_tokens = 0
         self.output_tokens = 0
         self.cached_tokens = 0
+        self._last_prompt_tokens = 0
 
     def set_custom_context(self, text: Optional[str]) -> None:
         """Set custom context text that will be prepended to the system prompt.
@@ -423,6 +530,79 @@ class AgentHarness:
             {"role": "user", "content": prompt},
         ]
 
+    # ── Context-window management ───────────────────────────────────────
+
+    def _trim_history(self, callback: Optional[Callable[..., Any]] = None) -> None:
+        """Trim conversation history to fit within the context window.
+
+        When the estimated token count approaches ``context_window``, old
+        turns are summarized into a compact system message to preserve
+        context without exceeding the window. The original system prompt
+        and the most recent turns are always kept.
+        """
+        if not self.messages or self.context_window <= 0:
+            return
+
+        last = self._last_prompt_tokens
+        estimated = last if isinstance(last, int) and last > 0 else self._estimate_token_count()
+        threshold = int(self.context_window * CONTEXT_WINDOW_TRIM_THRESHOLD)
+        if estimated <= threshold:
+            return
+
+        # Split into system prefix, middle (to summarize), and recent suffix.
+        system_msgs, rest = [], self.messages
+        if rest and rest[0].get("role") == "system":
+            system_msgs = [rest[0]]
+            rest = rest[1:]
+
+        keep_count = min(RECENT_TURNS_TO_KEEP, len(rest))
+        to_summarize = rest[:-keep_count] if keep_count > 0 else []
+        to_keep = rest[-keep_count:] if keep_count > 0 else rest
+        if not to_summarize:
+            return
+
+        summary = self._summarize_turns(to_summarize)
+        if callback:
+            callback({"type": "history_trimmed", "summarized": len(to_summarize)})
+
+        new_msgs = list(system_msgs)
+        if summary:
+            new_msgs.append({
+                "role": "system",
+                "content": f"--- Summary of earlier conversation ---\n{summary}\n--- End Summary ---",
+            })
+        new_msgs.extend(to_keep)
+        self.messages = new_msgs
+
+    def _summarize_turns(self, turns: List[Dict[str, Any]]) -> str:
+        """Summarize old conversation turns into compact text via the API."""
+        parts = []
+        for msg in turns:
+            role = msg.get("role", "unknown")
+            content = str(msg.get("content", "") or "")
+            if role == "tool":
+                content = content[:300]
+            parts.append(f"{role}: {content}")
+        conversation_text = "\n".join(parts)
+
+        try:
+            resp = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "Summarize the following conversation concisely, preserving key facts, decisions, and file paths."},
+                    {"role": "user", "content": conversation_text},
+                ],
+                max_tokens=SUMMARY_MAX_TOKENS,
+            )
+            return resp.choices[0].message.content or ""
+        except Exception:
+            return ""
+
+    def _estimate_token_count(self) -> int:
+        """Rough token estimate: ~4 characters per token across all messages."""
+        total_chars = sum(len(str(m.get("content", "") or "")) for m in self.messages)
+        return total_chars // 4
+
     def _track_and_emit_tokens(
         self,
         turn_input: int,
@@ -438,6 +618,7 @@ class AgentHarness:
         self.input_tokens += turn_input
         self.output_tokens += turn_output
         self.cached_tokens += turn_cached
+        self._last_prompt_tokens = turn_input
         if callback:
             callback({
                 "type": "tokens",
@@ -465,6 +646,8 @@ class AgentHarness:
             reasoning_content is the model's chain-of-thought (may be None).
             tool_calls is empty if there are no tool calls.
         """
+        if not response.choices:
+            return None, None, []
         choice = response.choices[0]
         message = choice.message
 

@@ -388,6 +388,96 @@ class TestRunIntegration:
         assert mock_client.chat.completions.create.call_count == 2
 
     @patch("harness.agent.OpenAI")
+    def test_empty_choices_does_not_crash(self, mock_openai):
+        """An empty choices array (e.g. content_filter) must not crash run()."""
+        mock_client = MagicMock()
+        mock_openai.return_value = mock_client
+
+        resp = MagicMock()
+        resp.choices = []
+        mock_client.chat.completions.create.return_value = resp
+
+        agent = AgentHarness(model="test-model", api_key="sk-test")
+        result = agent.run("Hello")
+
+        assert result == ""
+
+    @patch("harness.agent.time.sleep")
+    @patch("harness.agent.OpenAI")
+    def test_retries_on_rate_limit_error(self, mock_openai, mock_sleep):
+        """429 errors should be retried, not abort the turn."""
+        mock_client = MagicMock()
+        mock_openai.return_value = mock_client
+
+        class FakeAPIError(Exception):
+            def __init__(self, status_code):
+                self.status_code = status_code
+                super().__init__(f"HTTP {status_code}")
+
+        success_resp = MagicMock()
+        success_resp.choices = [MagicMock()]
+        success_resp.choices[0].message.tool_calls = None
+        success_resp.choices[0].message.content = "Success!"
+
+        mock_client.chat.completions.create.side_effect = [
+            FakeAPIError(429), success_resp
+        ]
+
+        agent = AgentHarness(model="test-model", api_key="sk-test")
+        result = agent.run("Hello")
+
+        assert result == "Success!"
+        assert mock_client.chat.completions.create.call_count == 2
+        assert mock_sleep.call_count == 1
+
+    @patch("harness.agent.time.sleep")
+    @patch("harness.agent.OpenAI")
+    def test_retries_on_server_error(self, mock_openai, mock_sleep):
+        """500 errors should be retried."""
+        mock_client = MagicMock()
+        mock_openai.return_value = mock_client
+
+        class FakeAPIError(Exception):
+            def __init__(self, status_code):
+                self.status_code = status_code
+                super().__init__(f"HTTP {status_code}")
+
+        success_resp = MagicMock()
+        success_resp.choices = [MagicMock()]
+        success_resp.choices[0].message.tool_calls = None
+        success_resp.choices[0].message.content = "OK"
+
+        mock_client.chat.completions.create.side_effect = [
+            FakeAPIError(503), success_resp
+        ]
+
+        agent = AgentHarness(model="test-model", api_key="sk-test")
+        result = agent.run("Hello")
+
+        assert result == "OK"
+        assert mock_client.chat.completions.create.call_count == 2
+
+    @patch("harness.agent.time.sleep")
+    @patch("harness.agent.OpenAI")
+    def test_does_not_retry_on_client_error(self, mock_openai, mock_sleep):
+        """400 errors should NOT be retried — they are not transient."""
+        mock_client = MagicMock()
+        mock_openai.return_value = mock_client
+
+        class FakeAPIError(Exception):
+            def __init__(self, status_code):
+                self.status_code = status_code
+                super().__init__(f"HTTP {status_code}")
+
+        mock_client.chat.completions.create.side_effect = FakeAPIError(400)
+
+        agent = AgentHarness(model="test-model", api_key="sk-test")
+        with pytest.raises(Exception):
+            agent.run("Hello")
+        assert mock_client.chat.completions.create.call_count == 1
+        assert mock_sleep.call_count == 0
+
+    @patch("harness.agent.OpenAI")
     def test_max_turns_limit(self, mock_openai):
         """The agent stops after max_turns even if model keeps calling tools."""
         mock_client = MagicMock()
@@ -412,6 +502,68 @@ class TestRunIntegration:
 
         assert "Max turns" in result
         assert mock_client.chat.completions.create.call_count == 3
+
+    @patch("harness.agent.OpenAI")
+    def test_finish_reason_length_emits_warning(self, mock_openai):
+        """finish_reason='length' should emit a warning callback event."""
+        mock_client = MagicMock()
+        mock_openai.return_value = mock_client
+
+        resp = MagicMock()
+        resp.choices = [MagicMock()]
+        resp.choices[0].message.tool_calls = None
+        resp.choices[0].message.content = "Truncated text..."
+        resp.choices[0].finish_reason = "length"
+        mock_client.chat.completions.create.return_value = resp
+
+        agent = AgentHarness(model="test-model", api_key="sk-test")
+        events = []
+        agent.run("Write a long essay", callback=events.append)
+
+        warnings = [e for e in events if e["type"] == "finish_reason"]
+        assert len(warnings) == 1
+        assert warnings[0]["reason"] == "length"
+
+    @patch("harness.agent.OpenAI")
+    def test_finish_reason_content_filter_emits_warning(self, mock_openai):
+        """finish_reason='content_filter' should emit a warning callback event."""
+        mock_client = MagicMock()
+        mock_openai.return_value = mock_client
+
+        resp = MagicMock()
+        resp.choices = [MagicMock()]
+        resp.choices[0].message.tool_calls = None
+        resp.choices[0].message.content = ""
+        resp.choices[0].finish_reason = "content_filter"
+        mock_client.chat.completions.create.return_value = resp
+
+        agent = AgentHarness(model="test-model", api_key="sk-test")
+        events = []
+        agent.run("Something flagged", callback=events.append)
+
+        warnings = [e for e in events if e["type"] == "finish_reason"]
+        assert len(warnings) == 1
+        assert warnings[0]["reason"] == "content_filter"
+
+    @patch("harness.agent.OpenAI")
+    def test_finish_reason_stop_no_warning(self, mock_openai):
+        """finish_reason='stop' should NOT emit a warning callback event."""
+        mock_client = MagicMock()
+        mock_openai.return_value = mock_client
+
+        resp = MagicMock()
+        resp.choices = [MagicMock()]
+        resp.choices[0].message.tool_calls = None
+        resp.choices[0].message.content = "Complete answer."
+        resp.choices[0].finish_reason = "stop"
+        mock_client.chat.completions.create.return_value = resp
+
+        agent = AgentHarness(model="test-model", api_key="sk-test")
+        events = []
+        agent.run("Hello", callback=events.append)
+
+        warnings = [e for e in events if e["type"] == "finish_reason"]
+        assert len(warnings) == 0
 
 
 class TestConversationHistory:
@@ -528,8 +680,8 @@ class TestProgressCallback:
         result = agent.run("Read /tmp/x.txt", callback=events.append)
 
         assert result == "File contents: hello"
-        # tokens + tool_call + tool_result + tokens + text = 5
-        assert len(events) == 5
+        # tokens + tool_call + tool_result + text_end(intermediate) + turn_start + tokens + text = 7
+        assert len(events) == 7
         assert events[0]["type"] == "tokens"
         assert events[1] == {
             "type": "tool_call",
@@ -539,8 +691,10 @@ class TestProgressCallback:
         assert events[2]["type"] == "tool_result"
         assert events[2]["name"] == "read"
         assert "Error" in events[2]["result"]  # file doesn't exist
-        assert events[3]["type"] == "tokens"
-        assert events[4] == {"type": "text", "content": "File contents: hello"}
+        assert events[3] == {"type": "text_end", "content": "Let me read the file."}
+        assert events[4]["type"] == "turn_start"
+        assert events[5]["type"] == "tokens"
+        assert events[6] == {"type": "text", "content": "File contents: hello"}
 
     @patch("harness.agent.OpenAI")
     def test_multiple_tool_calls_in_one_turn(self, mock_openai):
@@ -575,6 +729,7 @@ class TestProgressCallback:
             "tokens",
             "tool_call", "tool_result",  # read
             "tool_call", "tool_result",  # bash
+            "turn_start",                 # before the second turn
             "tokens",
             "text",                       # final
         ]
@@ -621,6 +776,40 @@ class TestProgressCallback:
             "content": "Step 1: analyze. Step 2: conclude.",
         }
         assert events[2] == {"type": "text", "content": "The answer is 42."}
+
+    @patch("harness.agent.OpenAI")
+    def test_reasoning_not_stored_in_api_bound_messages(self, mock_openai):
+        """reasoning_content must NOT be stored in messages sent back to the API.
+
+        Strict OpenAI-compatible providers 400 on the unknown field, and
+        re-sent CoT bloats every subsequent request.
+        """
+        mock_client = MagicMock()
+        mock_openai.return_value = mock_client
+
+        resp1 = MagicMock()
+        resp1.choices = [MagicMock()]
+        resp1.choices[0].message.tool_calls = None
+        resp1.choices[0].message.content = "Answer."
+        resp1.choices[0].message.reasoning_content = "My reasoning."
+
+        resp2 = MagicMock()
+        resp2.choices = [MagicMock()]
+        resp2.choices[0].message.tool_calls = None
+        resp2.choices[0].message.content = "Follow-up answer."
+
+        mock_client.chat.completions.create.side_effect = [resp1, resp2]
+
+        agent = AgentHarness(model="test-model", api_key="sk-test")
+        agent.run("First question")
+        agent.run("Second question")
+
+        # Check the messages sent on the second API call.
+        second_call_messages = mock_client.chat.completions.create.call_args_list[1][1]["messages"]
+        for msg in second_call_messages:
+            assert "reasoning_content" not in msg, (
+                f"reasoning_content found in {msg['role']} message sent to API"
+            )
 
 
 class TestTokenEvent:
@@ -1045,3 +1234,133 @@ class TestExtractReasoningFields:
         from harness.agent import _extract_reasoning_fields
         obj = self._obj(reasoning_content="")
         assert _extract_reasoning_fields(obj) is None
+
+
+class TestContextWindowManagement:
+    """Tests for context-window management with summarization (B2)."""
+
+    @patch("harness.agent.OpenAI")
+    def test_trims_history_when_approaching_context_window(self, mock_openai):
+        """When history nears the context window, old turns are summarized."""
+        mock_client = MagicMock()
+        mock_openai.return_value = mock_client
+
+        agent = AgentHarness(model="test-model", api_key="sk-test", context_window=1000)
+        # Pre-populate history with many messages.
+        agent.messages = [{"role": "system", "content": "System prompt"}]
+        for i in range(20):
+            agent.messages.append({"role": "user", "content": f"Question {i} " * 100})
+            agent.messages.append({"role": "assistant", "content": f"Answer {i} " * 100})
+        original_count = len(agent.messages)
+        # Simulate that the last API call reported prompt_tokens near the limit.
+        agent._last_prompt_tokens = 900
+
+        # Mock: first call = summary, second call = final response.
+        summary_resp = MagicMock()
+        summary_resp.choices = [MagicMock()]
+        summary_resp.choices[0].message.content = "Summary of earlier conversation"
+        summary_resp.choices[0].message.tool_calls = None
+        summary_resp.usage = MagicMock()
+        summary_resp.usage.prompt_tokens = 100
+        summary_resp.usage.completion_tokens = 50
+        summary_resp.usage.prompt_tokens_details = None
+
+        final_resp = MagicMock()
+        final_resp.choices = [MagicMock()]
+        final_resp.choices[0].message.content = "Final answer"
+        final_resp.choices[0].message.tool_calls = None
+        final_resp.usage = MagicMock()
+        final_resp.usage.prompt_tokens = 200
+        final_resp.usage.completion_tokens = 50
+        final_resp.usage.prompt_tokens_details = None
+
+        mock_client.chat.completions.create.side_effect = [summary_resp, final_resp]
+
+        result = agent.run("New question")
+
+        assert result == "Final answer"
+        # History should be shorter than before.
+        assert len(agent.messages) < original_count
+        # A summary system message should be present.
+        summaries = [
+            m for m in agent.messages
+            if m.get("role") == "system" and "Summary" in m.get("content", "")
+        ]
+        assert len(summaries) == 1
+        assert "Summary of earlier conversation" in summaries[0]["content"]
+
+    @patch("harness.agent.OpenAI")
+    def test_does_not_trim_when_history_is_small(self, mock_openai):
+        """No trimming or summarization when history is well within the window."""
+        mock_client = MagicMock()
+        mock_openai.return_value = mock_client
+
+        agent = AgentHarness(model="test-model", api_key="sk-test", context_window=100000)
+        agent.messages = [{"role": "system", "content": "System"}]
+        agent.messages.append({"role": "user", "content": "Hi"})
+        agent.messages.append({"role": "assistant", "content": "Hello"})
+        agent._last_prompt_tokens = 50
+
+        final_resp = MagicMock()
+        final_resp.choices = [MagicMock()]
+        final_resp.choices[0].message.content = "Response"
+        final_resp.choices[0].message.tool_calls = None
+        final_resp.usage = MagicMock()
+        final_resp.usage.prompt_tokens = 50
+        final_resp.usage.completion_tokens = 10
+        final_resp.usage.prompt_tokens_details = None
+
+        mock_client.chat.completions.create.return_value = final_resp
+
+        agent.run("Follow-up")
+
+        # Only one API call (no summary call).
+        assert mock_client.chat.completions.create.call_count == 1
+        # No summary message added.
+        summaries = [
+            m for m in agent.messages
+            if m.get("role") == "system" and "Summary" in m.get("content", "")
+        ]
+        assert len(summaries) == 0
+
+    @patch("harness.agent.OpenAI")
+    def test_trim_preserves_system_prompt_and_recent_turns(self, mock_openai):
+        """Trimming keeps the original system prompt and the most recent turns."""
+        mock_client = MagicMock()
+        mock_openai.return_value = mock_client
+
+        agent = AgentHarness(model="test-model", api_key="sk-test", context_window=1000)
+        system_msg = {"role": "system", "content": "System prompt"}
+        agent.messages = [system_msg]
+        for i in range(10):
+            agent.messages.append({"role": "user", "content": f"Q{i} " * 100})
+            agent.messages.append({"role": "assistant", "content": f"A{i} " * 100})
+        agent._last_prompt_tokens = 900
+
+        summary_resp = MagicMock()
+        summary_resp.choices = [MagicMock()]
+        summary_resp.choices[0].message.content = "Summary text"
+        summary_resp.choices[0].message.tool_calls = None
+        summary_resp.usage = MagicMock()
+        summary_resp.usage.prompt_tokens = 100
+        summary_resp.usage.completion_tokens = 50
+        summary_resp.usage.prompt_tokens_details = None
+
+        final_resp = MagicMock()
+        final_resp.choices = [MagicMock()]
+        final_resp.choices[0].message.content = "Done"
+        final_resp.choices[0].message.tool_calls = None
+        final_resp.usage = MagicMock()
+        final_resp.usage.prompt_tokens = 200
+        final_resp.usage.completion_tokens = 50
+        final_resp.usage.prompt_tokens_details = None
+
+        mock_client.chat.completions.create.side_effect = [summary_resp, final_resp]
+
+        agent.run("New question")
+
+        # System prompt is preserved as the first message.
+        assert agent.messages[0] is system_msg or agent.messages[0]["content"] == "System prompt"
+        # The new user question is present in the kept history.
+        user_msgs = [m for m in agent.messages if m.get("role") == "user"]
+        assert any("New question" in m["content"] for m in user_msgs)

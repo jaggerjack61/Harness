@@ -264,6 +264,39 @@ class TestStreamingRun:
         assert token_events[0]["output_tokens"] == 5
 
     @patch("harness.agent.OpenAI")
+    def test_streaming_passes_include_usage_option(self, mock_openai):
+        """Streaming requests must request usage in the final chunk.
+
+        OpenAI-spec endpoints only send chunk.usage when stream_options.
+        include_usage is True; otherwise every chunk's usage is None and the
+        token bar shows zeros for the whole session.
+        """
+        mock_client = MagicMock()
+        mock_openai.return_value = mock_client
+
+        def make_stream():
+            chunk = MagicMock()
+            choice = MagicMock()
+            delta = MagicMock()
+            delta.content = "Hi"
+            delta.tool_calls = None
+            delta.reasoning_content = None
+            choice.delta = delta
+            choice.finish_reason = "stop"
+            chunk.choices = [choice]
+            chunk.usage = None
+            yield chunk
+
+        mock_client.chat.completions.create.return_value = make_stream()
+
+        agent = AgentHarness(model="test-model", api_key="sk-test")
+        agent.run("Hi", stream=True)
+
+        _, kwargs = mock_client.chat.completions.create.call_args
+        assert kwargs.get("stream") is True
+        assert kwargs.get("stream_options") == {"include_usage": True}
+
+    @patch("harness.agent.OpenAI")
     def test_streaming_with_reasoning_emits_thinking_deltas(self, mock_openai):
         """A streaming response with reasoning emits thinking_delta events."""
         mock_client = MagicMock()
@@ -334,6 +367,62 @@ class TestStreamingRun:
         assert any(e["type"] == "tool_call" and e["name"] == "bash" for e in events)
         assert any(e["type"] == "tool_result" for e in events)
 
+    @patch("harness.agent.OpenAI")
+    def test_streaming_text_plus_tool_call_emits_text_end(self, mock_openai):
+        """A turn with both text and tool_calls must emit text_end for the text.
+
+        Without this, the CLI's response buffer accumulates intermediate text
+        that gets concatenated with the next turn's text, showing
+        "Let me check...All done" instead of two separate blocks.
+        """
+        mock_client = MagicMock()
+        mock_openai.return_value = mock_client
+
+        def first_stream():
+            # Text delta first, then tool call
+            chunk1 = MagicMock()
+            choice1 = MagicMock()
+            delta1 = MagicMock()
+            delta1.content = "Let me check..."
+            delta1.tool_calls = None
+            delta1.reasoning_content = None
+            choice1.delta = delta1
+            choice1.finish_reason = None
+            chunk1.choices = [choice1]
+            chunk1.usage = None
+            yield chunk1
+
+            yield _make_tool_call_chunk(0, "call_1", "bash", '{"command": "echo hi"}')
+
+        def second_stream():
+            chunk = MagicMock()
+            choice = MagicMock()
+            delta = MagicMock()
+            delta.content = "All done"
+            delta.tool_calls = None
+            delta.reasoning_content = None
+            choice.delta = delta
+            choice.finish_reason = "stop"
+            chunk.choices = [choice]
+            chunk.usage = None
+            yield chunk
+
+        mock_client.chat.completions.create.side_effect = [first_stream(), second_stream()]
+
+        agent = AgentHarness(model="test-model", api_key="sk-test")
+        events = []
+        result = agent.run("Check and report", callback=events.append, stream=True)
+
+        assert result == "All done"
+        # Intermediate text_end should be emitted for the first turn's text.
+        text_ends = [e for e in events if e["type"] == "text_end"]
+        assert len(text_ends) == 2
+        assert text_ends[0]["content"] == "Let me check..."
+        assert text_ends[1]["content"] == "All done"
+        # A turn_start event should be emitted before the second turn.
+        turn_starts = [e for e in events if e["type"] == "turn_start"]
+        assert len(turn_starts) == 1
+
 
 class TestStreamingCLI:
     """Test CLI streaming output."""
@@ -341,21 +430,20 @@ class TestStreamingCLI:
     @patch("harness.cli.AgentHarness")
     @patch("harness.cli.input")
     def test_stream_flag_enabled(self, mock_input, mock_harness):
-        """Test that --stream flag enables streaming."""
+        """--stream explicitly enables streaming (no longer a no-op)."""
         from harness.cli import _build_parser
         parser = _build_parser()
         args = parser.parse_args(["--stream"])
         assert args.stream is True
-        assert args.no_stream is False
-    
+
     @patch("harness.cli.AgentHarness")
     @patch("harness.cli.input")
     def test_no_stream_flag(self, mock_input, mock_harness):
-        """Test that --no-stream flag disables streaming."""
+        """--no-stream disables streaming."""
         from harness.cli import _build_parser
         parser = _build_parser()
         args = parser.parse_args(["--no-stream"])
-        assert args.no_stream is True
+        assert args.stream is False
     
     def test_stream_command_toggles(self):
         """Test /stream command toggles streaming mode."""

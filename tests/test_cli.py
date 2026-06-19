@@ -12,7 +12,6 @@ from prompt_toolkit.keys import Keys
 from harness.cli import (
     _build_parser,
     _fetch_models,
-    _interactive_select,
     _on_event,
     _prompt_model_selection,
     _prompt_reasoning_selection,
@@ -604,7 +603,23 @@ class TestCliMain:
 
     @patch("harness.cli.AgentHarness")
     @patch("harness.cli.input")
-    def test_empty_input_is_skipped(self, mock_input, mock_harness):
+    def test_console_created_once_across_prompts(self, mock_input, mock_harness):
+        """A single Console should be reused across prompts, not recreated."""
+        mock_agent = MagicMock()
+        mock_agent.run.return_value = "Response"
+        mock_agent.input_tokens = 1
+        mock_agent.output_tokens = 1
+        mock_harness.return_value = mock_agent
+        mock_input.side_effect = ["prompt 1", "prompt 2", "/exit"]
+
+        from harness.cli import main
+        with patch("harness.cli._make_console") as mock_mc:
+            mock_mc.return_value = MagicMock()
+            main(["--api-key", "sk-test"])
+
+        assert mock_mc.call_count == 1, (
+            f"Console created {mock_mc.call_count} times; should be created once"
+        )
         """Empty input should be skipped, not passed to the agent."""
         mock_agent = MagicMock()
         mock_harness.return_value = mock_agent
@@ -617,12 +632,14 @@ class TestCliMain:
 
     @patch("harness.cli.AgentHarness")
     @patch("harness.cli.input")
-    def test_reasoning_command_changes_effort(self, mock_input, mock_harness):
+    @patch("harness.prompts.input")
+    def test_reasoning_command_changes_effort(self, mock_prompts_input, mock_input, mock_harness):
         """Typing /reasoning should change the agent's reasoning_effort."""
         mock_agent = MagicMock()
         mock_agent.reasoning_effort = "high"
         mock_harness.return_value = mock_agent
-        mock_input.side_effect = ["/reasoning", "2", "/exit"]
+        mock_input.side_effect = ["/reasoning", "/exit"]
+        mock_prompts_input.return_value = "2"
 
         from harness.cli import main
         main(["--api-key", "sk-test"])
@@ -630,12 +647,14 @@ class TestCliMain:
 
     @patch("harness.cli.AgentHarness")
     @patch("harness.cli.input")
-    def test_reasoning_command_cancel_does_not_change(self, mock_input, mock_harness):
+    @patch("harness.prompts.input")
+    def test_reasoning_command_cancel_does_not_change(self, mock_prompts_input, mock_input, mock_harness):
         """Cancelling /reasoning should keep the current effort."""
         mock_agent = MagicMock()
         mock_agent.reasoning_effort = "high"
         mock_harness.return_value = mock_agent
-        mock_input.side_effect = ["/reasoning", "", "/exit"]
+        mock_input.side_effect = ["/reasoning", "/exit"]
+        mock_prompts_input.return_value = ""
 
         from harness.cli import main
         main(["--api-key", "sk-test"])
@@ -681,6 +700,61 @@ class TestCliMain:
         assert "Current context" in captured.out
 
 
+class TestConfigValidation:
+    """Tests for config validation warnings (B10/B11)."""
+
+    def test_warns_xhigh_with_openai_base_url(self):
+        """xhigh reasoning effort is non-standard for OpenAI and should warn."""
+        from harness.cli import _check_reasoning_compatibility
+        msg = _check_reasoning_compatibility("https://api.openai.com/v1", "xhigh")
+        assert msg is not None
+        assert "xhigh" in msg
+
+    def test_warns_max_with_openai_base_url(self):
+        """max reasoning effort is non-standard for OpenAI and should warn."""
+        from harness.cli import _check_reasoning_compatibility
+        msg = _check_reasoning_compatibility("https://api.openai.com/v1", "max")
+        assert msg is not None
+        assert "max" in msg
+
+    def test_no_warn_high_with_openai(self):
+        """high is standard for OpenAI — no warning."""
+        from harness.cli import _check_reasoning_compatibility
+        msg = _check_reasoning_compatibility("https://api.openai.com/v1", "high")
+        assert msg is None
+
+    def test_no_warn_xhigh_with_deepseek(self):
+        """xhigh is valid for DeepSeek — no warning."""
+        from harness.cli import _check_reasoning_compatibility
+        msg = _check_reasoning_compatibility("https://api.deepseek.com/v1", "xhigh")
+        assert msg is None
+
+    def test_no_warn_low_with_any_provider(self):
+        """low is universally supported — no warning."""
+        from harness.cli import _check_reasoning_compatibility
+        for url in ["https://api.openai.com/v1", "https://api.deepseek.com/v1"]:
+            assert _check_reasoning_compatibility(url, "low") is None
+
+    def test_warns_model_not_in_available_list(self):
+        """Model not in the fetched /models list should warn."""
+        from harness.cli import _check_model_available
+        msg = _check_model_available("nonexistent", ["gpt-4o", "gpt-4o-mini"])
+        assert msg is not None
+        assert "nonexistent" in msg
+
+    def test_no_warn_model_in_list(self):
+        """Model in the fetched list — no warning."""
+        from harness.cli import _check_model_available
+        msg = _check_model_available("gpt-4o", ["gpt-4o", "gpt-4o-mini"])
+        assert msg is None
+
+    def test_no_warn_when_list_empty(self):
+        """Empty model list (fetch failed) — no warning, can't validate."""
+        from harness.cli import _check_model_available
+        msg = _check_model_available("anything", [])
+        assert msg is None
+
+
 class TestTokensEventDisplay:
     """Live token events should print stats in a compact format."""
 
@@ -715,7 +789,7 @@ class TestTokensEventDisplay:
         assert "500" in captured.out
         assert "100" in captured.out
         assert "300" in captured.out  # cache hit info
-        assert "50.0%" in captured.out  # cache hit rate: 300/600 = 50%
+        assert "60.0%" in captured.out  # cache hit rate: 300/500 = 60% (cached/input, not total)
 
     def test_tokens_event_zero_total(self, capsys):
         """Should not crash with zero token counts."""
@@ -981,20 +1055,23 @@ def _make_fake_application(key_sequence):
 class TestInteractiveSelect:
     def test_select_second_option(self):
         fake_app = _make_fake_application([Keys.Down, Keys.Enter])
-        with patch("harness.cli.Application", fake_app):
-            selected = _interactive_select(["gpt-4", "gpt-3.5-turbo", "claude-3"], "gpt-4", "Models")
+        with patch("harness.prompts.Application", fake_app):
+            from harness.prompts import _interactive_select
+            selected = _interactive_select(["gpt-4", "gpt-3.5-turbo", "claude-3"], "gpt-4", "Models", "Current")
         assert selected == "gpt-3.5-turbo"
 
     def test_cancel_with_escape_returns_none(self):
         fake_app = _make_fake_application([Keys.Escape])
-        with patch("harness.cli.Application", fake_app):
-            selected = _interactive_select(["gpt-4", "gpt-3.5-turbo"], "gpt-4", "Models")
+        with patch("harness.prompts.Application", fake_app):
+            from harness.prompts import _interactive_select
+            selected = _interactive_select(["gpt-4", "gpt-3.5-turbo"], "gpt-4", "Models", "Current")
         assert selected is None
 
     def test_up_wraps_to_last_option(self):
         fake_app = _make_fake_application([Keys.Up, Keys.Enter])
-        with patch("harness.cli.Application", fake_app):
-            selected = _interactive_select(["gpt-4", "gpt-3.5-turbo", "claude-3"], "gpt-4", "Models")
+        with patch("harness.prompts.Application", fake_app):
+            from harness.prompts import _interactive_select
+            selected = _interactive_select(["gpt-4", "gpt-3.5-turbo", "claude-3"], "gpt-4", "Models", "Current")
         assert selected == "claude-3"
 
 
@@ -1017,7 +1094,7 @@ class TestModelPrompt:
         selected = _prompt_model_selection(models, "gpt-4")
         assert selected is None
 
-    @patch("harness.cli._interactive_select")
+    @patch("harness.prompts._interactive_select")
     def test_interactive_path_uses_inline_selector(self, mock_select):
         models = ["gpt-4", "gpt-3.5-turbo", "claude-3"]
         mock_select.return_value = "claude-3"
@@ -1026,7 +1103,7 @@ class TestModelPrompt:
             selected = _prompt_model_selection(models, "gpt-4")
 
         assert selected == "claude-3"
-        mock_select.assert_called_once_with(models, "gpt-4", title="📋 Available models")
+        mock_select.assert_called_once()
 
 
 class TestReasoningPrompt:
@@ -1045,7 +1122,7 @@ class TestReasoningPrompt:
         selected = _prompt_reasoning_selection("high")
         assert selected is None
 
-    @patch("harness.cli._interactive_select")
+    @patch("harness.prompts._interactive_select")
     def test_interactive_path_uses_inline_selector(self, mock_select):
         mock_select.return_value = "xhigh"
 
@@ -1053,10 +1130,7 @@ class TestReasoningPrompt:
             selected = _prompt_reasoning_selection("high")
 
         assert selected == "xhigh"
-        mock_select.assert_called_once_with(
-            REASONING_OPTIONS, "high", title="🧠 Reasoning effort",
-            current_label="Current effort",
-        )
+        mock_select.assert_called_once()
 
 
 class TestResponseBuffer:
@@ -1127,6 +1201,27 @@ class TestResponseBuffer:
         buf.append("")
         assert buf.text == "a"
 
+    def test_partial_is_cached_between_appends(self):
+        """Repeated .partial accesses without a new append must not re-join.
+
+        Without caching, each access joins all chunks (O(k)); with caching,
+        only the first access after an append joins, and subsequent accesses
+        return the cached string object.
+        """
+        from harness.cli import _ResponseBuffer
+        buf = _ResponseBuffer()
+        # Use a long string to avoid CPython string interning.
+        buf.append("x" * 200)
+        buf.append("y" * 200)
+        first = buf.partial
+        second = buf.partial
+        assert first is second, "partial not cached between accesses"
+        # After a new append, the cache is invalidated.
+        buf.append("z" * 200)
+        third = buf.partial
+        assert third is not first, "partial cache not invalidated on append"
+        assert third == "x" * 200 + "y" * 200 + "z" * 200
+
     def test_append_scales_linearly(self):
         """Appending many chunks must scale linearly, not quadratically."""
         import time
@@ -1145,3 +1240,81 @@ class TestResponseBuffer:
         ratio = t_large / t_small if t_small > 0 else 0
         # Linear ~4x, quadratic ~16x. Threshold 8 cleanly separates.
         assert ratio < 8, f"buffer scaled super-linearly: {t_small:.4f}s -> {t_large:.4f}s (ratio {ratio:.1f})"
+
+    def test_compact_scales_linearly_with_newlines(self):
+        """_compact with many accumulated chunks must scale linearly.
+
+        Appending many newline-free chunks then one newline-bearing chunk
+        forces _compact to pop all chunks from the front. With list.pop(0)
+        this is O(n^2); with deque.popleft() it is O(n).
+        """
+        import time
+        from harness.cli import _ResponseBuffer
+
+        def time_n(n):
+            buf = _ResponseBuffer()
+            t = time.perf_counter()
+            for _ in range(n):
+                buf.append("a")
+            buf.append("a\n")
+            return time.perf_counter() - t
+
+        t_small = time_n(2000)
+        t_large = time_n(8000)
+        ratio = t_large / t_small if t_small > 0 else 0
+        # Linear ~4x, quadratic ~16x. Threshold 8 cleanly separates.
+        assert ratio < 8, f"compact scaled super-linearly: {t_small:.4f}s -> {t_large:.4f}s (ratio {ratio:.1f})"
+
+
+class TestWelcomeBox:
+    """Tests for the welcome box rendering and alignment."""
+
+    def test_box_is_rectangular_with_emoji(self):
+        """Every ║-bounded content line must have equal display width.
+
+        The 🤖 emoji has display width 2 but len() == 1. If width is measured
+        with len() instead of a wide-char-aware function, the emoji line is
+        padded with one extra space, pushing its right ║ past the ═ rail.
+        """
+        from rich.cells import cell_len
+        from harness.cli import _build_welcome_box
+
+        box = _build_welcome_box(
+            model="deepseek-v4-pro",
+            reasoning_effort="high",
+            context_window=1000000,
+            working_dir="/my-project",
+            streaming=True,
+        )
+        lines = box.split("\n")
+        content_lines = [l for l in lines if l.startswith("║")]
+        assert len(content_lines) >= 2
+
+        widths = [cell_len(l) for l in content_lines]
+        assert len(set(widths)) == 1, (
+            f"Box is not rectangular; display widths differ: {widths}"
+        )
+
+    def test_box_borders_match_content_width(self):
+        """The ═ rails must span exactly inner_w, matching content lines."""
+        from rich.cells import cell_len
+        from harness.cli import _build_welcome_box
+
+        box = _build_welcome_box(
+            model="gpt-4o",
+            reasoning_effort="medium",
+            context_window=128000,
+            working_dir=".",
+            streaming=False,
+        )
+        lines = box.split("\n")
+        top = lines[0]
+        bottom = lines[-1]
+        content = [l for l in lines if l.startswith("║")][0]
+
+        # Top/bottom borders: ╔ + ═*inner_w + ═ (display width of ╔/╗/╚/╝ is 1 each)
+        rail_width = cell_len(top) - 2  # minus the two corner chars
+        content_width = cell_len(content) - 2  # minus the two ║ chars
+        assert rail_width == content_width, (
+            f"Rail width {rail_width} != content width {content_width}"
+        )

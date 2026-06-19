@@ -3,6 +3,7 @@
 import os
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -212,6 +213,36 @@ class TestEditFile:
         assert "success" in result.lower()
         assert "hi" in f.read_text(encoding="utf-8", errors="replace")
 
+    def test_edit_refuses_multiple_matches(self, tmp_path: Path):
+        """oldText appearing more than once should error, not silently pick the first."""
+        f = tmp_path / "edit.txt"
+        f.write_text("foo bar foo baz")
+        result = edit_file(str(f), [{"oldText": "foo", "newText": "qux"}])
+        assert "Error" in result
+        assert "2" in result  # mentions the occurrence count
+
+    def test_edit_detects_cross_edit_overlap(self, tmp_path: Path):
+        """Edits that overlap in the original text should error."""
+        f = tmp_path / "edit.txt"
+        f.write_text("foo bar")
+        result = edit_file(str(f), [
+            {"oldText": "foo", "newText": "foofoo"},
+            {"oldText": "foo", "newText": "bar"},
+        ])
+        assert "Error" in result
+        assert "overlap" in result.lower()
+
+    def test_edit_non_overlapping_edits_succeed(self, tmp_path: Path):
+        """Multiple non-overlapping edits should still work after the fix."""
+        f = tmp_path / "edit.txt"
+        f.write_text("alpha beta gamma")
+        result = edit_file(str(f), [
+            {"oldText": "alpha", "newText": "ALPHA"},
+            {"oldText": "gamma", "newText": "GAMMA"},
+        ])
+        assert "success" in result.lower()
+        assert f.read_text() == "ALPHA beta GAMMA"
+
 
 class TestRunBash:
     def test_runs_simple_command(self):
@@ -231,6 +262,49 @@ class TestRunBash:
         result = run_bash('python -c "for i in range(500): print(i)" 2>&1')
         # Just ensure it returns something without crashing
         assert len(result) > 0
+
+
+class TestWindowsShellResolution:
+    """Tests for PowerShell executable resolution (B8)."""
+
+    def test_prefers_pwsh_over_powershell(self):
+        """When both pwsh and powershell are available, pwsh (7+) is preferred."""
+        from harness.tools import _get_windows_shell
+        import harness.tools as tools_mod
+        tools_mod._WINDOWS_SHELL = None
+        with patch("harness.tools.shutil.which", side_effect=lambda c: "/usr/bin/pwsh" if c == "pwsh" else "/usr/bin/powershell"):
+            with patch.dict("os.environ", {}, clear=True):
+                shell = _get_windows_shell()
+        assert shell == "pwsh"
+
+    def test_falls_back_to_powershell_when_pwsh_absent(self):
+        """When only powershell is available, it is used."""
+        from harness.tools import _get_windows_shell
+        import harness.tools as tools_mod
+        tools_mod._WINDOWS_SHELL = None
+        with patch("harness.tools.shutil.which", side_effect=lambda c: None if c == "pwsh" else "/usr/bin/powershell"):
+            with patch.dict("os.environ", {}, clear=True):
+                shell = _get_windows_shell()
+        assert shell == "powershell"
+
+    def test_respects_harness_shell_env_override(self):
+        """HARNESS_SHELL env var overrides auto-detection."""
+        from harness.tools import _get_windows_shell
+        import harness.tools as tools_mod
+        tools_mod._WINDOWS_SHELL = None
+        with patch.dict("os.environ", {"HARNESS_SHELL": "/custom/shell"}):
+            shell = _get_windows_shell()
+        assert shell == "/custom/shell"
+
+    def test_defaults_to_powershell_when_neither_found(self):
+        """When neither is found, defaults to powershell (lets the OS error)."""
+        from harness.tools import _get_windows_shell
+        import harness.tools as tools_mod
+        tools_mod._WINDOWS_SHELL = None
+        with patch("harness.tools.shutil.which", return_value=None):
+            with patch.dict("os.environ", {}, clear=True):
+                shell = _get_windows_shell()
+        assert shell == "powershell"
 
     def test_cwd_is_current_by_default(self, tmp_path: Path):
         marker = tmp_path / "marker"
