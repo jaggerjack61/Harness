@@ -131,7 +131,7 @@ Then just type a prompt and watch the agent work!
 |---|---|
 | `/exit` | Quit the harness |
 | `/clear` | Reset conversation history and token counters (keeps custom context) |
-| `/models` | Browse and select from available models fetched from the API |
+| `/models` | Browse and select from available models fetched from the configured API (`--base-url`/models) |
 | `/reasoning` | Interactively change the reasoning effort level |
 | `/stream` | Toggle streaming mode on/off |
 | `/context` | Enter custom context text (multiline, end with `.` on its own line) |

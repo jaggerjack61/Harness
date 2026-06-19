@@ -11,6 +11,7 @@ from prompt_toolkit.keys import Keys
 
 from harness.cli import (
     _build_parser,
+    _fetch_models,
     _interactive_select,
     _on_event,
     _prompt_model_selection,
@@ -97,6 +98,59 @@ class TestArgumentParser:
         parser = _build_parser()
         args = parser.parse_args(["--reasoning-effort", "low"])
         assert args.reasoning_effort == "low"
+
+
+class TestFetchModels:
+    @patch("harness.cli.httpx.get")
+    def test_uses_configured_base_url(self, mock_get):
+        """_fetch_models should query the configured base_url's /models endpoint."""
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status.return_value = None
+        mock_resp.json.return_value = {
+            "data": [
+                {"id": "gpt-4"},
+                {"id": "gpt-3.5-turbo"},
+            ]
+        }
+        mock_get.return_value = mock_resp
+
+        models = _fetch_models("https://api.example.com/v1", "sk-test")
+
+        mock_get.assert_called_once_with(
+            "https://api.example.com/v1/models",
+            headers={"Authorization": "Bearer sk-test"},
+            timeout=10.0,
+        )
+        assert models == ["gpt-3.5-turbo", "gpt-4"]
+
+    @patch("harness.cli.httpx.get")
+    def test_uses_no_auth_header_without_api_key(self, mock_get):
+        """When no API key is provided, no Authorization header should be sent."""
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status.return_value = None
+        mock_resp.json.return_value = {"data": [{"id": "local-model"}]}
+        mock_get.return_value = mock_resp
+
+        models = _fetch_models("https://localhost:8080/v1", None)
+
+        mock_get.assert_called_once_with(
+            "https://localhost:8080/v1/models",
+            headers={},
+            timeout=10.0,
+        )
+        assert models == ["local-model"]
+
+    @patch("harness.cli.httpx.get")
+    def test_returns_empty_list_on_error(self, mock_get, capsys):
+        """A failed request should return an empty list and print an error."""
+        mock_get.side_effect = Exception("connection refused")
+
+        models = _fetch_models("https://localhost:8080/v1", None)
+
+        assert models == []
+        captured = capsys.readouterr()
+        assert "Failed to fetch models" in captured.out
+        assert "connection refused" in captured.out
 
 
 class TestOnEvent:

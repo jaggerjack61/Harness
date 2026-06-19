@@ -10,7 +10,7 @@ import os
 import sys
 import textwrap
 import time
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 from prompt_toolkit.application import Application
@@ -620,11 +620,19 @@ def _clear_status_bar() -> None:
         _live = None
 
 
-def _fetch_models() -> List[str]:
-    """Fetch available models from the OpenCode API."""
-    url = "https://opencode.ai/zen/go/v1/models"
+def _fetch_models(base_url: str, api_key: Optional[str] = None) -> List[str]:
+    """Fetch available models from the configured API's /models endpoint.
+
+    The list is queried against the user's configured --base-url (an
+    OpenAI-compatible endpoint), optionally authenticating with the provided
+    API key.
+    """
+    url = f"{base_url.rstrip('/')}/models"
+    headers: Dict[str, str] = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
     try:
-        resp = httpx.get(url, timeout=10.0)
+        resp = httpx.get(url, headers=headers, timeout=10.0)
         resp.raise_for_status()
         data = resp.json()
         models = [m["id"] for m in data.get("data", [])]
@@ -873,7 +881,7 @@ def main(argv: Optional[list] = None) -> None:
     print()
 
     # Pre-fetch models on launch so /models is instant
-    models = _fetch_models()
+    models = _fetch_models(args.base_url, args.api_key)
     if models:
         print(f"📦 {len(models)} models loaded. Use /models to switch.\n")
     else:
@@ -918,7 +926,7 @@ def main(argv: Optional[list] = None) -> None:
         if user_input.lower() == "/models":
             if not models:
                 print("\nFetching models...")
-                models = _fetch_models()
+                models = _fetch_models(args.base_url, args.api_key)
             selected = _prompt_model_selection(models, current_model)
             if selected and selected != current_model:
                 current_model = selected
