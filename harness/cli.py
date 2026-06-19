@@ -8,6 +8,7 @@ import argparse
 import json
 import os
 import sys
+import textwrap
 import time
 from typing import Any, List, Optional
 
@@ -16,6 +17,7 @@ from prompt_toolkit.application import Application
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import Layout, Window
 from prompt_toolkit.layout.controls import FormattedTextControl
+from rich.cells import cell_len
 from rich.console import Console, Group
 from rich.errors import MarkupError
 from rich.live import Live
@@ -208,12 +210,9 @@ def _flush_thinking_lines() -> None:
     global _thinking_line_buf, _thinking_first_line, _thinking_renderable
     while "\n" in _thinking_line_buf:
         line, _thinking_line_buf = _thinking_line_buf.split("\n", 1)
-        prefix = "  🧠 " if _thinking_first_line else "     "
+        first_prefix = "  🧠 " if _thinking_first_line else "     "
         _thinking_first_line = False
-        if _console is not None:
-            _console.print(f"{prefix}[dim]{rich_escape(line)}[/dim]", highlight=False)
-        else:
-            print(f"{prefix}{line}")
+        _print_wrapped([line], first_prefix, "     ", style="dim")
     # Mirror the remaining partial line into the live region.
     if _thinking_line_buf:
         prefix = "  🧠 " if _thinking_first_line else "     "
@@ -227,15 +226,74 @@ def _flush_thinking_end() -> None:
     """Flush any trailing partial thinking line and reset for the next block."""
     global _thinking_line_buf, _thinking_first_line, _thinking_renderable
     if _thinking_line_buf:
-        prefix = "  🧠 " if _thinking_first_line else "     "
-        if _console is not None:
-            _console.print(f"{prefix}[dim]{rich_escape(_thinking_line_buf)}[/dim]", highlight=False)
-        else:
-            print(f"{prefix}{_thinking_line_buf}")
+        first_prefix = "  🧠 " if _thinking_first_line else "     "
+        _print_wrapped([_thinking_line_buf], first_prefix, "     ", style="dim")
         _thinking_line_buf = ""
     _thinking_first_line = True  # next thinking block gets a fresh 🧠 marker
     _thinking_renderable = None
     _update_live()
+
+
+def _available_width(prefix_width: int) -> int:
+    """Return the number of columns left for content after a prefix."""
+    if _console is not None:
+        return max(1, _console.width - prefix_width)
+    try:
+        return max(1, os.get_terminal_size().columns - prefix_width)
+    except OSError:
+        return max(1, 80 - prefix_width)
+
+
+def _wrap_line(line: str, width: int) -> List[str]:
+    """Wrap a single logical line into chunks no wider than ``width``."""
+    if width <= 0:
+        return [line]
+    chunks = textwrap.wrap(
+        line,
+        width=width,
+        replace_whitespace=False,
+        drop_whitespace=False,
+        break_long_words=True,
+        break_on_hyphens=True,
+    )
+    if not chunks:
+        return [""]
+    # Remove leading whitespace from wrapped continuation chunks only; the
+    # first chunk keeps any intentional indentation on the original line.
+    return [chunks[0]] + [chunk.lstrip() for chunk in chunks[1:]]
+
+
+def _print_wrapped(
+    lines: List[str],
+    first_prefix: str,
+    rest_prefix: str,
+    style: str = "",
+) -> None:
+    """Print logical lines with prefixes, preserving indentation on wraps.
+
+    Each logical line is wrapped to fit the remaining terminal width. The
+    first physical chunk uses ``first_prefix``; any additional wrapped chunks
+    for that line (and all chunks of subsequent logical lines) use
+    ``rest_prefix`` so nothing snaps back to the left margin.
+    """
+    first_logical = True
+    for line in lines:
+        prefix = first_prefix if first_logical else rest_prefix
+        prefix_width = cell_len(prefix)
+        chunks = _wrap_line(line, _available_width(prefix_width))
+        for i, chunk in enumerate(chunks):
+            chunk_prefix = prefix if i == 0 else rest_prefix
+            if _console is not None:
+                if style:
+                    _console.print(
+                        f"{chunk_prefix}[{style}]{rich_escape(chunk)}[/{style}]",
+                        highlight=False,
+                    )
+                else:
+                    _console.print(f"{chunk_prefix}{rich_escape(chunk)}", highlight=False)
+            else:
+                print(f"{chunk_prefix}{chunk}")
+        first_logical = False
 
 
 def _on_event(event: dict) -> None:
@@ -260,12 +318,12 @@ def _on_event(event: dict) -> None:
         # the live status bar. The first line gets the 🧠 marker.
         content = event.get("content", "")
         if content:
-            for i, line in enumerate(content.splitlines()):
-                prefix = "  🧠 " if i == 0 else "     "
-                if _console is not None:
-                    _console.print(f"{prefix}[dim]{rich_escape(line)}[/dim]", highlight=False)
-                else:
-                    print(f"{prefix}{line}")
+            _print_wrapped(
+                content.splitlines(),
+                first_prefix="  🧠 ",
+                rest_prefix="     ",
+                style="dim",
+            )
 
     elif etype == "thinking_delta":
         # Stream thinking content. Deltas are not line-aligned, so we buffer
@@ -297,7 +355,11 @@ def _on_event(event: dict) -> None:
 
         if name == "bash":
             cmd = args.get("command", "")
-            print(f"\n  🔧 {BLUE}{cmd}{RESET}", flush=True)
+            cmd_lines = cmd.splitlines()
+            if cmd_lines:
+                print(f"\n  🔧 {BLUE}{cmd_lines[0]}{RESET}", flush=True)
+                for line in cmd_lines[1:]:
+                    print(f"     {BLUE}{line}{RESET}", flush=True)
         elif name == "write":
             path = args.get("path", "")
             content = args.get("content", "")

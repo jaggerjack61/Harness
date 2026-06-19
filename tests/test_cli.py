@@ -1,5 +1,6 @@
 """Tests for the interactive CLI."""
 
+import re
 import sys
 from io import StringIO
 from unittest.mock import patch, MagicMock
@@ -125,6 +126,22 @@ class TestOnEvent:
         assert "read" in captured.out
         assert "foo.txt" in captured.out
 
+    def test_multiline_bash_command_indents_continuation_lines(self, capsys):
+        """A bash command containing newlines must keep all lines indented."""
+        _on_event({
+            "type": "tool_call",
+            "name": "bash",
+            "arguments": {"command": "echo first\necho second"},
+        })
+        captured = capsys.readouterr()
+        # Strip ANSI colour codes so we can inspect indentation.
+        clean = re.sub(r"\x1b\[[0-9;]*m", "", captured.out)
+        lines = [line for line in clean.splitlines() if line.strip()]
+        # Header line keeps its wrench icon.
+        assert lines[0].startswith("  🔧")
+        # Continuation lines must be indented, not flush to the left margin.
+        assert lines[1].startswith("     ")
+
     def test_tool_result_event_prints(self, capsys):
         _on_event({
             "type": "tool_result",
@@ -151,6 +168,24 @@ class TestOnEvent:
         assert "reason" in captured.out
         # Fallback path (no _console) uses plain text without ANSI codes
         assert "\033[90m" not in captured.out
+
+    def test_long_thinking_line_wraps_with_indent(self):
+        """Wrapped continuation lines of a thinking block must stay indented."""
+        import harness.cli as cli
+        from io import StringIO
+        from rich.console import Console
+
+        buf = StringIO()
+        cli._console = Console(file=buf, width=30, force_terminal=False, no_color=True)
+        _on_event({
+            "type": "thinking",
+            "content": "This is a very long thinking line that should wrap",
+        })
+        out = buf.getvalue()
+        lines = [line for line in out.splitlines() if line.strip()]
+        assert len(lines) > 1, "line should have wrapped"
+        for line in lines:
+            assert line.startswith(("  ", "     ")), f"unindented wrapped line: {line!r}"
 
     def test_thinking_delta_event_buffers_partial_line(self, capsys):
         """A thinking_delta without a newline is buffered, not printed to stdout."""
